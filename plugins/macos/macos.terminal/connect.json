@@ -1,0 +1,22 @@
+{
+  "platform": "macos",
+  "match_first": [],
+  "is_default": true,
+  "is_set": true,
+  "is_internal": true,
+  "executable": {
+    "type": "bundled",
+    "default": "Terminal"
+  },
+  "launch": {
+    "type": "script",
+    "script": "scripts/launch.macos.applescript",
+    "interpreter": "/usr/bin/osascript",
+    "accepts_command": true,
+    "use_ssh_helper": true,
+    "protocol_aliases": {
+      "telnet": "ssh"
+    }
+  },
+  "display_name": "Terminal"
+}

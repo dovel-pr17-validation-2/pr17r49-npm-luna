@@ -1,0 +1,19 @@
+{
+  "platform": "macos",
+  "match_first": [],
+  "is_default": false,
+  "is_set": false,
+  "is_internal": true,
+  "executable": {
+    "type": "application_bundle",
+    "default": "/Applications/iTerm.app"
+  },
+  "launch": {
+    "type": "script",
+    "script": "scripts/launch.macos.applescript",
+    "interpreter": "/usr/bin/osascript",
+    "use_ssh_helper": true,
+    "accepts_command": true
+  },
+  "display_name": "iTerm2"
+}

@@ -1,0 +1,21 @@
+{
+  "platform": "linux",
+  "match_first": [],
+  "is_default": true,
+  "is_set": true,
+  "is_internal": true,
+  "executable": {
+    "type": "system",
+    "default": "x-terminal-emulator"
+  },
+  "launch": {
+    "type": "module",
+    "module": "scripts/launch.mjs",
+    "accepts_command": true,
+    "use_ssh_helper": true,
+    "protocol_aliases": {
+      "telnet": "ssh"
+    }
+  },
+  "display_name": "Terminal"
+}

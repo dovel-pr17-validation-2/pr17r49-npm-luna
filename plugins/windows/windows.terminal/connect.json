@@ -1,0 +1,21 @@
+{
+  "platform": "windows",
+  "match_first": [],
+  "is_default": false,
+  "is_set": true,
+  "is_internal": false,
+  "executable": {
+    "type": "system",
+    "default": "wt.exe"
+  },
+  "launch": {
+    "type": "module",
+    "module": "scripts/launch.mjs",
+    "accepts_command": true,
+    "use_ssh_helper": true,
+    "protocol_aliases": {
+      "telnet": "ssh"
+    }
+  },
+  "display_name": "Windows Terminal"
+}

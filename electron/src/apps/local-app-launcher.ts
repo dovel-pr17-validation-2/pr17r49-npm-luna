@@ -1,0 +1,391 @@
+import { spawn } from "node:child_process";
+import { mkdir, stat, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { decodeClientProtocolPayload as decodePayload } from "../shared/client-protocol";
+import { electronLog } from "../shared/debug-log";
+
+function sanitizedName(raw) {
+  let decoded = String(raw || "");
+  try {
+    decoded = decodeURIComponent(decoded);
+  } catch {
+    // Keep the original plugin-provided label when it is not URI encoded.
+  }
+  return decoded.replaceAll(" ", "").replace(/[:-]/g, "_");
+}
+
+function username(payload) {
+  return ["ssh", "sftp", "telnet"].includes(payload.protocol)
+    ? `JMS-${payload.token?.id || ""}`
+    : String(payload.token?.id || "");
+}
+
+function valuesFor(payload): Record<string, string> {
+  return {
+    name: sanitizedName(payload.name),
+    protocol: payload.protocol,
+    username: username(payload),
+    value: String(payload.token?.value || ""),
+    host: String(payload.endpoint?.host || ""),
+    port: String(payload.endpoint?.port || ""),
+    dbname: payload.protocol === "oracle" ? username(payload) : String(payload.asset?.info?.db_name || "")
+  };
+}
+
+function render(template, values) {
+  return String(template || "").replace(/\{([a-z_]+)\}/gi, (matched, key) =>
+    Object.hasOwn(values, key) ? String(values[key]) : matched
+  );
+}
+
+function splitArguments(input) {
+  const args = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  for (const character of String(input)) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+    } else if (character === "\\" && quote !== "'") {
+      escaped = true;
+    } else if (quote) {
+      if (character === quote) quote = "";
+      else current += character;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (/\s/.test(character)) {
+      if (current) {
+        args.push(current);
+        current = "";
+      }
+    } else {
+      current += character;
+    }
+  }
+  if (escaped) current += "\\";
+  if (quote) throw new Error("application argument template contains an unclosed quote");
+  if (current) args.push(current);
+  return args.flatMap((argument) => argument.split("*"));
+}
+
+function spawnDetached(executable, args, options = {}, waitForExit = false, input?: string, exitMessages = {}) {
+  return new Promise<void>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      detached: !waitForExit,
+      stdio: input === undefined ? "ignore" : ["pipe", "ignore", "ignore"],
+      ...options
+    });
+    // Do not include spawnargs in errors: connection arguments can contain credentials.
+    const fail = (error: NodeJS.ErrnoException) => {
+      reject(new Error(`failed to launch client '${executable}': ${error.code || "spawn failed"}`));
+    };
+    child.once("error", fail);
+    child.once("spawn", () => {
+      if (waitForExit) return;
+      child.unref();
+      resolve();
+    });
+    if (waitForExit) {
+      child.once("exit", (code, signal) => {
+        if (code === 0) resolve();
+        else {
+          const message = typeof exitMessages[code] === "string" ? exitMessages[code] : `exit code ${code}`;
+          reject(new Error(`failed to launch client '${executable}': ${signal || message}`));
+        }
+      });
+    }
+    if (input !== undefined) {
+      child.stdin.once("error", fail);
+      child.stdin.end(input);
+    }
+  });
+}
+
+const pluginModuleRunner = String.raw`
+const { pathToFileURL } = require("node:url");
+(async () => {
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) input += chunk;
+  const plugin = await import(pathToFileURL(process.argv[1]).href);
+  process.stdout.write(JSON.stringify(await plugin.default(JSON.parse(input))));
+})().catch(() => process.exit(1));
+`;
+
+function runPluginModule(filename, input): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
+    delete env.JMS_CONNECT_JSON;
+    const child = spawn(process.execPath, ["-e", pluginModuleRunner, filename], {
+      env,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "ignore"]
+    });
+    let output = "";
+    const timer = setTimeout(fail, 30_000);
+    function fail() {
+      clearTimeout(timer);
+      child.kill();
+      reject(new Error("Plugin could not prepare the connection"));
+    }
+    child.once("error", fail);
+    child.stdin.once("error", fail);
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      if (Buffer.byteLength(output) > 1024 * 1024) fail();
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return fail();
+      try {
+        resolve(JSON.parse(output));
+      } catch {
+        fail();
+      }
+    });
+    child.stdin.end(input);
+  });
+}
+
+function shellQuote(value) {
+  if (process.platform === "win32") return `"${String(value).replaceAll('"', '\\"')}"`;
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+async function isFile(candidate) {
+  try {
+    return (await stat(candidate)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function isDirectory(candidate) {
+  try {
+    return (await stat(candidate)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+export class LocalApplicationLauncher {
+  // ponytail: migration keeps legacy dynamic state; replace with explicit launcher adapter types when strict mode is enabled.
+  [key: string]: any;
+
+  constructor(app, projectRoot, configService, electronShell, isPackaged = app.isPackaged) {
+    this.app = app;
+    this.projectRoot = projectRoot;
+    this.configService = configService;
+    this.electronShell = electronShell;
+    this.isPackaged = isPackaged;
+  }
+
+  helperCommand() {
+    return shellQuote(this.helperExecutable());
+  }
+
+  helperExecutable() {
+    const resourceRoot = this.isPackaged ? this.projectRoot : path.join(this.projectRoot, ".electron-resources");
+    return path.join(resourceRoot, "bin", process.platform === "win32" ? "jms-ssh.exe" : "jms-ssh");
+  }
+
+  async resolveApplication(payload) {
+    const config = await this.configService.getConfig();
+    const client = String(payload.client || payload.client_name || "");
+    for (const category of ["terminal", "filetransfer", "remotedesktop", "databases"]) {
+      for (const item of config[category] || []) {
+        if (
+          !item.protocol.includes(payload.protocol) ||
+          !item.is_set ||
+          !(item.enabled_protocols || item.match_first).includes(payload.protocol)
+        )
+          continue;
+        if (client && item.name === client) return item;
+        if (!client && item.match_first.includes(payload.protocol)) return item;
+      }
+    }
+    throw new Error(
+      `no configured application selected for protocol '${payload.protocol}'${client ? ` and client '${client}'` : ""}`
+    );
+  }
+
+  async resolveExecutable(application) {
+    const configured = String(application.path || "").trim();
+    if (configured.includes("\0")) throw new Error("Invalid application path");
+    if (await isFile(configured)) return configured;
+    if (application.executable_type === "application_bundle" && (await isDirectory(configured))) return configured;
+    if (application.is_internal) {
+      const bundled = path.join(application.plugin_dir || "", configured);
+      if (await isFile(bundled)) return bundled;
+      if (configured) return configured;
+    }
+    if (application.executable_type === "system" && configured) return configured;
+    throw new Error(`configured application '${application.display_name}' not found at '${configured}'`);
+  }
+
+  async launchExecutable(application, argumentString, values) {
+    const executable = await this.resolveExecutable(application);
+    const args = Array.isArray(argumentString) ? argumentString : splitArguments(argumentString);
+    if (!args.every((arg) => typeof arg === "string" && !arg.includes("\0"))) {
+      throw new Error("Invalid application arguments");
+    }
+    const env = { ...process.env };
+    for (const [key, template] of Object.entries(application.env || {})) env[key] = render(template, values);
+    return spawnDetached(executable, args, { env });
+  }
+
+  async launchInTerminal(command, payload) {
+    const config = await this.configService.getConfig();
+    const hosts = (config.terminal || []).filter((item) => item.use_ssh_helper);
+    const host =
+      hosts.find((item) => item.match_first.includes("ssh")) ||
+      hosts.find((item) => (item.enabled_protocols || item.match_first).includes("ssh"));
+    // ponytail: custom SSH templates cannot safely embed arbitrary commands; add an explicit command template before enabling command support.
+    if (!host?.is_set || !host.accepts_command || host.uses_terminal_host) {
+      throw new Error("The selected terminal host cannot open command payloads");
+    }
+    return this.launchApplication(host, { ...payload, command });
+  }
+
+  async launchFile(application, payload) {
+    const extension = payload.protocol === "rdp" ? "rdp" : "vnc";
+    const base = sanitizedName(payload.file?.name || payload.name) || "connection";
+    const connectionPath = path.join(this.configService.configDir, `${base}.${extension}`);
+    await mkdir(this.configService.configDir, { recursive: true });
+    await writeFile(connectionPath, String(payload.file?.content || ""), { mode: 0o600 });
+    if (process.platform === "darwin") {
+      return spawnDetached("open", ["-a", application.path, connectionPath], {}, true);
+    }
+    const args = splitArguments(application.arg_format).map((argument) => render(argument, { file: connectionPath }));
+    await this.launchExecutable(application, args, {});
+  }
+
+  async resolvePluginFile(application, relativePath) {
+    const pluginRoot = path.resolve(application.plugin_dir);
+    const filename = path.resolve(pluginRoot, relativePath || "");
+    if (!filename.startsWith(pluginRoot + path.sep) || !(await isFile(filename))) {
+      throw new Error("Plugin entry point was not found");
+    }
+    return filename;
+  }
+
+  async connectionContext(application, payload, values) {
+    const command = String(payload.command || "");
+    return {
+      ...valuesFor(payload),
+      ...values,
+      source_name: String(payload.name || ""),
+      port: payload.endpoint.port,
+      executable: await this.resolveExecutable(application),
+      config_dir: this.configService?.configDir || "",
+      helper: values.helper || "",
+      helper_executable: values.helper_executable || "",
+      command: command.trim() ? command : "",
+      connect_options: payload.connect_options || {},
+      asset: { info: { db_name: payload.asset?.info?.db_name || "" } },
+      file: { name: payload.file?.name || "", content: payload.file?.content || "" }
+    };
+  }
+
+  async launchModule(application, payload, values) {
+    const filename = await this.resolvePluginFile(application, application.module_path);
+    const context = await this.connectionContext(application, payload, values);
+    const plan = await runPluginModule(filename, JSON.stringify(context));
+    if (
+      plan?.type === "args" &&
+      Array.isArray(plan.args) &&
+      plan.args.every((arg) => typeof arg === "string" && !arg.includes("\0"))
+    ) {
+      return this.launchExecutable(application, plan.args, values);
+    }
+    if (
+      plan?.type === "terminal" &&
+      application.uses_terminal_host &&
+      typeof plan.command === "string" &&
+      plan.command.trim() &&
+      !plan.command.includes("\0")
+    ) {
+      return this.launchInTerminal(plan.command, payload);
+    }
+    throw new Error("Plugin returned an invalid launch plan");
+  }
+
+  async launchScript(application, payload, values) {
+    const scriptPath = await this.resolvePluginFile(application, application.script_path);
+    const input = JSON.stringify(await this.connectionContext(application, payload, values));
+    const env = { ...process.env };
+    const useStdin = application.script_input === "stdin";
+    if (useStdin) delete env.JMS_CONNECT_JSON;
+    else env.JMS_CONNECT_JSON = input;
+    for (const [key, template] of Object.entries(application.env || {})) env[key] = render(template, values);
+    const interpreter = String(application.script_interpreter || "").trim();
+    const useNode = interpreter === "node";
+    if (useNode) env.ELECTRON_RUN_AS_NODE = "1";
+    const run = () =>
+      spawnDetached(
+        useNode ? process.execPath : interpreter || scriptPath,
+        interpreter ? [scriptPath] : [],
+        { env, windowsHide: true },
+        true,
+        useStdin ? `${input}\n` : undefined,
+        application.script_exit_messages
+      );
+    if (!application.script_serialize) return run();
+    this.scriptQueues ||= new Map();
+    const pending = (this.scriptQueues.get(scriptPath) || Promise.resolve()).catch(() => {}).then(run);
+    this.scriptQueues.set(scriptPath, pending);
+    try {
+      await pending;
+    } finally {
+      if (this.scriptQueues.get(scriptPath) === pending) this.scriptQueues.delete(scriptPath);
+    }
+  }
+
+  async launch(raw) {
+    const payload = decodePayload(raw);
+    if (!payload.protocol || !payload.token?.id) {
+      throw new Error("local client payload is missing required connection fields");
+    }
+    const selectionProtocol =
+      payload.protocol === "mysql" && payload.token?.protocol === "mariadb" ? "mariadb" : payload.protocol;
+    const application = await this.resolveApplication({ ...payload, protocol: selectionProtocol });
+    // Preserve MariaDB application preferences, but use the MySQL driver on Magnus's shared port.
+    if (selectionProtocol === "mariadb") payload.protocol = "mysql";
+    if (application.launch_type === "file") {
+      if (!payload.file?.content) throw new Error("local client payload is missing connection file content");
+      electronLog.info(`launch ${payload.protocol} connection file via ${application.display_name || "file handler"}`);
+      return this.launchFile(application, payload);
+    }
+    if (!payload.endpoint?.host || !payload.endpoint?.port) {
+      throw new Error("local client payload is missing required connection fields");
+    }
+    electronLog.info(
+      `launch ${payload.protocol} ${payload.endpoint.host}:${payload.endpoint.port} via ${application.display_name || application.launch_type}`
+    );
+    return this.launchApplication(application, payload);
+  }
+
+  async launchApplication(application, payload) {
+    const values = valuesFor(payload);
+    if (application.use_ssh_helper) {
+      values.helper = this.helperCommand();
+      values.helper_executable = this.helperExecutable();
+    }
+    if (application.protocol_aliases?.[payload.protocol])
+      values.protocol = application.protocol_aliases[payload.protocol];
+    if (String(payload.command || "").trim() && !application.accepts_command) {
+      throw new Error("Selected application cannot open command payloads");
+    }
+    if (application.launch_type === "module") return this.launchModule(application, payload, values);
+    if (application.launch_type === "script") return this.launchScript(application, payload, values);
+    const template = application.protocol_templates?.[payload.protocol] || application.arg_format;
+    const argumentString = render(template, values);
+    if (application.launch_type === "url") return this.electronShell.openExternal(argumentString);
+    if (application.launch_type === "args") return this.launchExecutable(application, argumentString, values);
+    throw new Error("Unsupported application launch type");
+  }
+}
+
+export const localAppLauncherInternals = { decodePayload, render, splitArguments, valuesFor };

@@ -1,0 +1,652 @@
+import type { DropdownMenuItem } from "@nuxt/ui";
+import type { LangType } from "../../i18n/language";
+
+export type ActionType = "action" | "select";
+export type SortType = "name" | "-name" | "-date_updated" | "date_updated";
+export type ThemeType = "light" | "dark" | "withSystem" | "";
+export type ThemePresetId =
+  | "latte"
+  | "matcha"
+  | "claude"
+  | "gemini"
+  | "mono"
+  | "min"
+  | "luna-default"
+  | "luna-darkgray"
+  | "luna-deepblue"
+  | "mocha"
+  | "macchiato"
+  | "frappe"
+  | "kanagawa"
+  | "ayu"
+  | "rose-pine"
+  | "codex"
+  | "cursor"
+  | "mono-dark"
+  | "nord";
+export type LayoutsType = "grid" | "table";
+export type { LangType } from "../../i18n/language";
+export type LanguagePreference = LangType | "system";
+export type CharsetType = "default" | "utf8" | "gbk" | "gb2312" | "ios-8859-1";
+export type ResolutionType = "auto" | "1024x768" | "1366x768" | "1600x900" | "1920x1080";
+export type AssetPageType =
+  | "assets"
+  | "linux"
+  | "windows"
+  | "windows_ad"
+  | "other"
+  | "database"
+  | "device"
+  | "web"
+  | "favorite";
+export type SidebarSectionKey = "assets" | "favorites" | "snippets";
+
+export interface SidebarSectionVisibility {
+  assets: boolean;
+  favorites: boolean;
+  snippets: boolean;
+}
+
+export interface ActionItem {
+  key: string;
+  iconName: string;
+  tooltipLabel: string;
+  type: ActionType;
+  selectItems?: DropdownMenuItem[];
+  onClick?: () => void;
+}
+
+export interface ConfigItem {
+  name: string;
+  display_name: string;
+  protocol: string[];
+  comment: {
+    zh: string;
+    en: string;
+  };
+  download_url: string;
+  type: string;
+  path: string;
+  arg_format: string;
+  match_first: string[];
+  enabled_protocols?: string[];
+  is_internal: boolean;
+  is_default: boolean;
+  is_set: boolean;
+  executable_type?: string;
+  path_exists?: boolean;
+  plugin_id?: string;
+  builtin?: boolean;
+  icon_path?: string;
+  use_ssh_helper?: boolean;
+  uses_terminal_host?: boolean;
+  path_display?: string;
+  path_copyable?: boolean;
+  path_selectable?: boolean;
+}
+
+export interface AppConfigType {
+  terminal: ConfigItem[];
+  remotedesktop: ConfigItem[];
+  filetransfer: ConfigItem[];
+  databases: ConfigItem[];
+}
+
+export interface PluginListItem {
+  id: string;
+  name: string;
+  display_name: string;
+  version: string;
+  category: string;
+  protocols: string[];
+  builtin: boolean;
+  enabled: boolean;
+  path: string;
+  path_exists?: boolean;
+  executable_type?: string;
+  icon_path?: string;
+  plugin_dir?: string;
+  download_url?: string;
+  comment?: {
+    zh?: string;
+    en?: string;
+  };
+}
+
+export interface Cookies {
+  path: string;
+  name: string;
+  value: string;
+  domain: string;
+  secure: boolean;
+  httpOnly: boolean;
+}
+
+export interface PermOrgItem {
+  id: string;
+  name: string;
+  is_root: boolean;
+  is_default: boolean;
+  is_system: boolean;
+  comment?: string;
+}
+
+export interface CurrentOrg extends PermOrgItem {
+  comment: string;
+}
+
+export interface PermissionOrgs {
+  pam_orgs?: PermOrgItem[];
+  audit_orgs?: PermOrgItem[];
+  console_orgs?: PermOrgItem[];
+  workbench_orgs?: PermOrgItem[];
+  id: string;
+  username: string;
+}
+
+export interface RoleType {
+  display_name: string;
+  id: string;
+}
+
+export interface LabeledValue<T extends string | number = string> {
+  label: string;
+  value: T;
+}
+
+export interface UserProfile {
+  id: string;
+  name: string;
+  username: string;
+  email: string;
+  avatar_url?: string;
+  phone?: string | { code?: string | null; phone?: string | null } | null;
+  wechat?: string | null;
+  source?: string | LabeledValue;
+  mfa_level?: number | LabeledValue<number>;
+  mfa_enabled?: boolean;
+  is_active?: boolean;
+  is_valid?: boolean;
+  is_expired?: boolean;
+  date_joined?: string | null;
+  last_login?: string | null;
+  date_expired?: string | null;
+  system_roles?: RoleType[];
+  org_roles?: Array<RoleType & { name?: string }>;
+}
+
+export interface ClientLoginPolicy {
+  reauth_on_exit: boolean;
+  reauth_on_exit_required?: boolean;
+  reauth_on_exit_user?: boolean | null;
+  // Minutes; 0 disables the limit.
+  idle_lock_time: number;
+  idle_lock_time_limit?: number;
+  idle_lock_time_user?: number | null;
+  // Minutes; 0 disables the limit.
+  max_session_time: number;
+  max_session_time_limit?: number;
+  max_session_time_user?: number | null;
+}
+
+export interface ClientLoginSession {
+  locked?: boolean;
+  authenticated_at: string;
+  expires_at: string | null;
+  policy_expires_at?: string | null;
+  effective_expires_at?: string | null;
+  expiry_reason?: "absolute_timeout" | "policy_changed" | null;
+  server_time: string;
+}
+
+export interface ClientPolicyNotice {
+  id: string;
+  kind: "absolute_timeout" | "policy_changed" | "idle_lock";
+  at: string;
+  remainingSeconds?: number;
+}
+
+export interface ClientNoticeAppearance {
+  dark: boolean;
+  variables: Record<string, string>;
+  fontFamily: string;
+  fontSize: string;
+}
+
+export interface ClientNoticeSnapshot {
+  notices: ClientPolicyNotice[];
+  locale: string;
+  appearance?: ClientNoticeAppearance;
+}
+
+export type ClientLoginReason =
+  | "policy_changed"
+  | "absolute_timeout"
+  | "security_revoke"
+  | "app_exit"
+  | "logout"
+  | "unknown";
+
+export interface UserData {
+  accountId: string;
+  userId?: string;
+  siteName: string;
+  site: string;
+  name: string;
+  language?: string;
+  bearerToken: string;
+  clientLoginPolicy?: ClientLoginPolicy;
+  clientLoginSession?: ClientLoginSession;
+  system_roles: RoleType[];
+  org: CurrentOrg;
+  availableOrgs: PermOrgItem[];
+  connectionInfo: ConnectionInfo;
+  xpackLicenseValid?: boolean;
+  commandExecutionEnabled?: boolean;
+}
+
+export interface UserIntiInfo {
+  status: string;
+  bearer: string;
+  version?: string;
+  xpack_license_valid?: boolean;
+  security_command_execution?: boolean;
+  client_login_policy?: ClientLoginPolicy;
+  client_login_session?: ClientLoginSession;
+  resolved_site?: string;
+  profile: {
+    data: string;
+  };
+  current_org: {
+    data: string;
+  };
+  permission_orgs: {
+    data: string;
+  };
+}
+
+export interface AssetCategory {
+  value: string;
+  label: string;
+}
+
+export interface AssetConnectivity {
+  value: string;
+  label: string;
+}
+
+export interface AssetNode {
+  id: string;
+  name: string;
+}
+
+export type AssetTreeKind = "authorization" | "type" | "search";
+
+interface AssetTreeChoice {
+  name?: string;
+  value?: string;
+}
+
+interface AssetTreeNodeData {
+  id?: string;
+  org_id?: string;
+  name?: string;
+  address?: string;
+  comment?: string;
+  type?: string | AssetTreeChoice;
+  category?: string | AssetTreeChoice;
+  platform?: string | AssetTreeChoice;
+  platform_type?: string;
+  zone?: string | AssetTreeChoice;
+  is_active?: boolean;
+  permedProtocols?: PermedProtocol[];
+  permed_protocols?: PermedProtocol[];
+  sftp?: boolean;
+  permedAccounts?: PermedAccount[];
+  permed_accounts?: PermedAccount[];
+  is_root?: boolean;
+}
+
+export interface AssetTreeNextPage {
+  phase: "nodes" | "assets";
+  nodeCursor?: string;
+  assetOffset?: number;
+}
+
+export interface AssetTreeNodeMeta {
+  type?: string;
+  data?: AssetTreeNodeData;
+}
+
+export interface AssetTreeNode {
+  id: string;
+  key?: string;
+  pId?: string | null;
+  name: string;
+  title?: string;
+  isParent?: boolean;
+  open?: boolean;
+  iconSkin?: string;
+  type?: string;
+  category?: string;
+  chkDisabled?: boolean;
+  meta?: AssetTreeNodeMeta;
+  children?: AssetTreeNode[];
+  level?: number;
+  loaded?: boolean;
+  loading?: boolean;
+  loadingMore?: boolean;
+  nextPage?: AssetTreeNextPage | null;
+  nextPageTriggerIndex?: number;
+  assetCount?: number | null;
+  assetCountLoading?: boolean;
+}
+
+export interface AssetPlatform {
+  id: number;
+  name: string;
+}
+
+export interface AssetType {
+  value: string;
+  label: string;
+}
+
+export interface AssetZone {
+  id: string;
+  name: string;
+}
+
+export interface UserItem {
+  id: string;
+  name: string;
+}
+
+export interface PermedProtocol {
+  name: string;
+  port: number;
+  public: boolean;
+  setting?: any;
+}
+
+export interface Actions {
+  label: string;
+  value: string;
+}
+
+export interface PermedAccount {
+  auto_push_protocols?: string[];
+  alias: string;
+  date_expired: string;
+  has_secret: boolean;
+  has_username: boolean;
+  id: string;
+  name: string;
+  secret_type: string;
+  username: string;
+  actions: Actions[];
+}
+
+export interface PersonalAssetCredential {
+  id: string;
+  asset: {
+    id: string;
+    name: string;
+    address: string;
+  };
+  username: string;
+  secret_type: string | LabeledValue;
+  protocol: string | LabeledValue;
+  comment: string;
+  is_active: boolean;
+  version: number;
+  has_secret: boolean;
+}
+
+export interface RawAssetData {
+  id: string;
+  name?: string;
+  address?: string;
+  category?: AssetCategory;
+  comment?: string;
+  connectivity?: AssetConnectivity;
+  created_by?: string;
+  date_created?: string;
+  date_verified?: string | null;
+  is_active?: boolean;
+  labels?: string[];
+  nodes?: AssetNode[];
+  org_id?: string;
+  org_name?: string;
+  platform?: AssetPlatform;
+  type?: AssetType;
+  zone?: AssetZone;
+  permedProtocols?: PermedProtocol[];
+  permedAccounts?: PermedAccount[];
+}
+
+export type AssetDetailField = string | { name?: string; value?: string };
+
+export interface AssetDetail {
+  id?: string;
+  name?: string;
+  address?: string;
+  org_id?: string;
+  platform?: AssetDetailField;
+  type?: AssetDetailField;
+  zone?: AssetDetailField;
+  category?: AssetDetailField;
+  is_active?: boolean;
+  permed_protocols?: PermedProtocol[];
+  permed_accounts?: PermedAccount[];
+  permedProtocols?: PermedProtocol[];
+  permedAccounts?: PermedAccount[];
+  spec_info?: {
+    db_name?: string;
+    success_selector?: string;
+    interactive_selector?: string;
+    allowed_urls?: string[];
+    autofill?: string;
+  };
+}
+
+export interface AssetItem {
+  id: string;
+  name: string;
+  address: string;
+  org_id?: string;
+  user?: string;
+  platform: string;
+  zone: string;
+  isActive: boolean;
+  comment?: string;
+  category: string;
+  type: string;
+  permedProtocols?: PermedProtocol[];
+  permedAccounts?: PermedAccount[];
+  displayAddressLine?: string;
+  savedConnection?: ConnectionInfo;
+  isFavorite?: boolean;
+}
+
+export interface AssetsResponse {
+  count: number;
+  next: string | null;
+  previous: string | null;
+  results: RawAssetData[];
+}
+
+export interface ConnectionInfo {
+  protocol: string;
+  username: string;
+  accountId?: string;
+  accountMode?: "hosted" | "dynamic" | "manual" | "anonymous";
+  manualUsername?: string;
+  manualPassword?: string;
+  personalCredentialId?: string;
+  personalCredentialVersion?: number;
+  personalCredentialSecretType?: string;
+  rememberSecret?: boolean;
+  dynamicPassword?: string;
+  availableProtocols?: string[];
+  connectMethod?: string;
+  connectOptions?: RdpGraphics;
+}
+
+export interface ConnectionPreferenceInfo {
+  protocol?: string;
+  username?: string;
+  accountId?: string;
+  accountMode?: "hosted" | "dynamic" | "manual" | "anonymous";
+  manualUsername?: string;
+  availableProtocols?: string[];
+  connectMethod?: string;
+  connectOptions?: RdpGraphics;
+}
+
+export interface ProtocolConnectionPreferenceInfo {
+  connectMethod: string;
+}
+
+export interface ConnectMethod {
+  name: string;
+  display_name: string;
+  protocols: string[];
+  type: string;
+  is_default: boolean;
+  is_internal: boolean;
+}
+
+export type RdpSecurity = "default" | "any" | "rdp" | "tls" | "nla";
+
+export interface RdpGraphics {
+  charset?: CharsetType;
+  backspaceAsCtrlH?: boolean;
+  disableautohash?: boolean;
+  use_sysdba?: boolean;
+  rdp_resolution?: string;
+  resolution?: string;
+  keyboard_layout?: string;
+  rdp_client_option?: string[];
+  printers_redirect?: boolean;
+  rdp_color_quality?: string;
+  rdp_smart_size?: string;
+  applet_connection_method?: string;
+  appletConnectMethod?: string;
+  virtualappConnectMethod?: string;
+  reusable?: boolean;
+  token_reusable?: boolean;
+  remote_microphone?: boolean;
+  rdp_connection_speed?: "auto" | "low_speed_broadband" | "high_speed_broadband";
+  rdp_security?: RdpSecurity;
+  file_name_conflict_resolution?: string;
+}
+
+export interface SettingResponse {
+  basic: {
+    is_async_asset_tree: boolean;
+    connect_default_open_method: string;
+  };
+  graphics: RdpGraphics;
+  command_line: {
+    character_terminal_font_size: number;
+    is_backspace_as_ctrl_h: boolean;
+    is_right_click_quickly_paste: boolean;
+    terminal_theme_name: string;
+    charset?: CharsetType;
+  };
+}
+
+export interface ConnectionBody {
+  asset: string;
+  account: string;
+  protocol: string;
+  input_username?: string;
+  input_secret?: string;
+  input_secret_type?: string;
+  personal_credential_id?: string;
+  personal_credential_version?: number;
+  save_personal_credential?: boolean;
+  connect_method: string;
+  connect_options: RdpGraphics;
+}
+
+export interface TokenResponse {
+  account_preparation_required?: boolean;
+  code?: string;
+  detail?: string;
+  account: string;
+  actions: [];
+  asset: AssetNode;
+  asset_display: string;
+  connect_method: string;
+  connect_options: RdpGraphics;
+  created_by: string;
+  date_created: string;
+  date_expired: string;
+  date_updated: string;
+  expire_time: number;
+  acl?: {
+    requirements: Record<string, "pending" | "running" | "passed" | "failed">;
+    steps?: string[];
+    face_online: boolean;
+    face_online_acknowledged?: boolean;
+    face_token?: string;
+    mfa_methods: { value: string; label: string; challenge_required: boolean }[];
+    reviewers?: { id: string; name: string; username: string }[];
+    review_group?: string;
+    review_status?: string;
+    preparation?: { status: "queued" | "running" | "failed" | "ready"; detail: string; execution_id?: string };
+    cancelled: boolean;
+    error?: string;
+  };
+  face_token?: string;
+  face_monitor_token?: string;
+  from_ticket: any;
+  from_ticket_info: any;
+  id: string;
+  input_username: string;
+  personal_credential_id?: string;
+  is_active: boolean;
+  is_expired: boolean;
+  is_reusable: boolean;
+  org_id: string;
+  org_name: string;
+  protocol: string;
+  remote_addr: string;
+  updated_by: string;
+  user: UserItem;
+  user_display: string;
+  value: string;
+}
+
+export type ConnectionTokenReuseResponse = Pick<TokenResponse, "id" | "date_expired" | "is_reusable">;
+
+export interface UserSettingPersistedState {
+  language: LanguagePreference;
+  collapse: boolean;
+  sort: SortType;
+  theme: ThemeType;
+  themeMode: ThemeType;
+  followSystem: boolean;
+  layouts: LayoutsType;
+  fontFamily: string;
+  uiFontSize: number;
+  codeFontSize: number;
+  primaryColor: string;
+  primaryColorLight: string;
+  primaryColorDark: string;
+  lightThemePreset: ThemePresetId;
+  darkThemePreset: ThemePresetId;
+  appConfig: AppConfigType | null;
+  charset: CharsetType;
+  rdpResolution: ResolutionType;
+  backspaceAsCtrlH: boolean;
+  keyboardLayout: string;
+  rdpClientOption: string[];
+  rdpColorQuality: string;
+  rdpSmartSize: string;
+  recentSites: string[];
+  sidebarWidth: number;
+  sidebarSections: SidebarSectionVisibility;
+}

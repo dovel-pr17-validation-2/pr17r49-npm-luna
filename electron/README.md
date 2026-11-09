@@ -1,0 +1,199 @@
+# Electron desktop runtime
+
+This directory contains the JumpServer desktop runtime.
+
+Desktop connections first check anonymous
+`GET /api/v1/settings/client/compatibility/` in the main process. Both
+`base(app.getVersion()) >= base(Core.MIN_CLIENT_VERSION)` and
+`base(Core.VERSION) >= MIN_CORE_VERSION` determine compatibility, except that Core's exact
+`dev` version skips the Core minimum check. The client's minimum lives in
+`src/auth/compatibility.ts` and is currently `v5.2.0`. Core represents the whole
+server release, including Koko, Chen and Kael. Developers decide whether a
+contract change breaks old clients; reviewers check that decision. Compatible
+releases leave the minimums unchanged. There is no component version matrix,
+automatic updater or automated compatibility gate.
+
+Release builds already run `scripts/set-version.js` to inject the complete
+version into the Electron package. Core's development version defaults to
+`v5.1.0`; Luna's package versions remain `5.1.0`. Compatibility API values and
+client version labels use a single `v` prefix. Release builds still inject their
+actual versions. Do not reuse an existing release number for new capabilities.
+Client and Core minimum comparisons use only the validated base `X.Y.Z`,
+ignoring prerelease and build suffixes on both versions. Thus `5.1.0-rc3`,
+`5.1.0-beta8` and `5.1.0-lts+build.1` share the `5.1.0` baseline. A leading
+`v` is accepted. Compatibility results retain the complete client and Core versions.
+
+Login, saved-account restoration and site switching share the same preflight.
+It uses the same Electron network adapter, proxy configuration and user-entered
+site certificate trust as login. Requests remain anonymous and uncached, and
+normal redirects follow the existing network policy. The final response must
+contain valid compatibility JSON to pass the check. Incompatible versions,
+missing endpoints, invalid responses, timeouts and TLS failures show the shared
+confirmation dialog. Continuing skips the preflight for that connection,
+including restoration retries; cancellation leaves the active session unchanged.
+Confirmation is bound to the site, account and current connection generation.
+A new connection, main-process cancellation or session activation expires it.
+Authentication and profile validation still precede session activation. Checks
+never fall back to the legacy version array.
+After activation, restoration of the same active site and account reuses its
+compatibility decision while still refreshing credentials and validating the
+profile. A new login, site/account switch, logout or client restart requires
+a new check.
+
+Core owns login validity: its fixed deadline and revocation are checked on API
+requests and refreshes. Activity and refresh never extend that deadline. Daily
+token cleanup reclaims records and does not determine login validity. Connection
+tokens follow their own expiry and permissions.
+
+The main process reads `GET /api/v1/authentication/client-login-session/status/`
+for the active account every 30 seconds, including while hidden or unfocused.
+Successful token refresh replaces the pending status read. Inactive saved accounts
+are checked when selected, while their absolute login deadlines continue to run.
+Network errors do not invalidate a login. Confirmed expiry shows a persistent
+reason and a background system notification when supported.
+
+`idle_lock_time` controls screen locking, in minutes (0 disables automatic locking).
+The main process samples system keyboard/mouse idle time every second without
+reporting each action. At timeout or manual lock it shields the windows immediately
+and sends one `POST .../client-login-session/lock/` to record the server lock.
+Offline locks remain shielded and pending requests retry on the status interval;
+unlock waits for server synchronization. Only the active site/account has an idle timer; switching accounts
+starts a fresh interval and never unlocks an already locked account. Input in
+external applications counts as system activity, but those applications are not
+protected by the client lock. Suspending locks the active protected account.
+
+New logins open normally. Restoring an already locked login preserves its lock.
+Idle timeout locks even when no lock password has been configured. The main page
+and its managed asset windows are shielded without disconnecting transports;
+only the main page can unlock. `GET .../client-login-session/unlock/` reports whether the current
+account has a password and its site-specific web settings URL. `POST` to that
+same endpoint verifies `{password}` for the bearer account, with five attempts
+per minute, and clears `ClientLoginSession.is_locked` only after verification.
+Business API requests are denied with `403 client_locked` while locked; status,
+lock/unlock/revoke and read-only identity bootstrap remain available. Refresh
+preserves the lock. The main process releases the shield after server success;
+renderer events cannot clear it.
+Passwords are never persisted by the client. Locked native website views remain
+hidden even when tabs or asynchronous callbacks request visibility.
+
+Lina Personal settings → User authentication has separate Client credentials
+and File encryption tabs for the client lock password and existing file password.
+`GET/PATCH /api/v1/users/profile/client-credentials/` accepts only a web session;
+PATCH follows the existing sensitive-operation confirmation policy. The client
+password is a Django password hash; the file password retains its encrypted
+storage and existing file encryption/decryption behavior. Empty fields preserve
+existing values. Links include the expected user ID so a browser signed into a
+different account cannot silently configure the wrong account.
+
+Access tokens last at most one hour, capped by the login deadline. Requests refresh
+them when at most 60 seconds remain (or 10% for shorter tokens). Concurrent refreshes
+are shared. Refresh never extends the login or unlocks the client.
+
+Run `pnpm test:electron`, `pnpm test:web`, `pnpm lint:check` and `pnpm typecheck`.
+For desktop review, use local test servers and release-versioned test builds:
+check both minimum boundaries, each single failure and both failures, an old Core
+returning 404, continuing or cancelling a failed check, and restoration retries.
+Keep A connected while B awaits confirmation, then rapidly switch B/C and verify
+only the latest confirmation can activate. These checks must not access production accounts.
+
+Run the current development shell with:
+
+```sh
+pnpm electron:dev
+```
+
+Desktop development and packaging require Go 1.25 or newer to build the bundled `jms-ssh` helper.
+On macOS, development builds ad-hoc sign the helper; release builds use `CSC_NAME` and verify the packaged helper before completing.
+
+Windows signing hooks run only in GitHub Actions (`GITHUB_ACTIONS=true`); local builds
+always use `off`, even when signing credentials or `WINDOWS_SIGN_MODE` are set. The
+release Action defaults to `optional` and also supports `required` and `off` through
+`WINDOWS_SIGN_MODE`. Signing helpers live in `scripts/windows-sign.ts` and use
+`SIGNPANEL_URL` (an HTTPS origin) and `SIGNPANEL_API_TOKEN` through `scripts/sign-ci.ps1`.
+Optional mode warns on the first signing failure, keeps the original file, and
+skips subsequent signing attempts so packaging and publishing can continue. Required
+mode stops the build on missing credentials, signing failures, or invalid signatures.
+Off mode skips all Windows signing. Signed files replace their originals only after
+download integrity and Authenticode verification succeed.
+
+Forge signs only the project executables `JumpServer.exe`, `resources/bin/jms-ssh.exe`,
+and the optional `resources/face-engine/facelive-worker.exe` before making installers.
+NSIS signs only its generated uninstaller and setup executable; WiX MSI signing follows
+filename normalization. Bundled third-party binaries, including Electron runtime DLLs,
+plugins, NSIS `elevate.exe`, and all `node_modules` files, are excluded from signing.
+When SignPanel is not configured, signing in Actions still supports
+`WINDOWS_CERTIFICATE_FILE` (and `WINDOWS_CERTIFICATE_PASSWORD`) or
+`WINDOWS_SIGN_WITH_PARAMS` under the same mode policy.
+
+The client release Action maps the existing SignPanel secrets (the URL may also be a
+repository variable). Manual builds expose `windows_sign_mode`; tag builds use the
+`WINDOWS_SIGN_MODE` repository variable or default to `optional`. Installer signatures
+are checked before upload; only `required` treats signature failures as fatal. Release
+checksums are generated from the final artifacts.
+
+The native face engine has its own uv-managed Python sidecar. For local engine
+checks, prepare it once and open `/face` in the development renderer:
+
+```sh
+pnpm face:setup
+pnpm electron:dev
+```
+
+Face registration, authentication, and presence monitoring stay local to the
+desktop process. Monitoring performs its liveness challenge once during
+initialization and then switches to presence-only checks.
+
+The launcher allocates independent Nuxt and HMR ports, starts the renderer, and
+then opens Electron through Electron Forge. TypeScript sources live under `src/`
+by domain (`desktop`, `auth`, `apps`, `replay`, `web-proxy`). Vite compiles the
+`bootstrap.ts` and `preload.ts` entries. The preload keeps context isolation and
+the Chromium sandbox enabled. It exposes a deliberately narrow desktop bridge to
+the UI.
+
+Currently migrated:
+
+- OAuth, encrypted token persistence, API session bootstrap, and organization switching;
+- native windows, menus, tray, single-instance behavior, and protocol registration;
+- settings storage, scoped filesystem access, dialogs, clipboard, and safe external links;
+- Koko terminal/Kubernetes/SFTP, Lion RDP, Chen database, and secondary asset windows;
+- local shell PTY sessions powered by `node-pty`;
+- isolated Web Proxy views, one-time encrypted credential autofill, and Koko recording upload;
+- scoped offline recording import, decompression, and local replay URLs;
+- platform application plugins, external native-client launch, and system font enumeration;
+- replay-to-MP4 conversion through the Node replay pipeline and optional FFmpeg plugin.
+- native face registration, authentication, liveness challenges, and presence monitoring through an isolated Python sidecar.
+
+Remaining release work:
+
+- cross-platform CI builds for macOS, Windows, and Linux;
+- code signing/notarization and updater channel wiring.
+
+Create a local unpacked production app with `pnpm electron:package:dir`, or build platform artifacts
+with `pnpm electron:build`. Packaging uses Electron Forge makers: DMG on macOS, NSIS/WiX on
+Windows, and DEB/RPM on Linux. Linux no longer produces AppImage.
+
+Packaged clients register only `jms2://` and use `jms2://auth/callback` for OAuth.
+`jms://` belongs to the legacy client. The server's OAuth application must allow
+the new callback URI; clients do not fall back to the legacy scheme.
+Development uses `http://127.0.0.1:14876/auth/callback`. An occupied callback port
+fails the login instead of handing its result to another installed client.
+Unpackaged macOS builds do not register Electron.app as a protocol handler.
+
+Windows Squirrel install/update registers `jms2` and uninstall removes this
+client's registration. MSI and unpacked builds register when the app is first
+started. Protocol launches use the initial arguments when the app is closed and
+single-instance forwarding when it is running. Run `pnpm test:electron` for
+simulated Windows lifecycle checks. On Windows, also verify both launch states
+from an install path containing spaces, the OAuth callback and an asset link,
+and that installing/updating the new client does not change the legacy `jms`
+handler. Native installer/registry behavior needs a Windows host.
+
+The server generates `jms2://` asset links for the web "open with application" action. Asset links carry a connection token and launch through the main process
+without requiring a desktop login. Local protocol preferences take precedence;
+missing preferences use the platform defaults (Terminal for macOS/Linux SSH,
+bundled PuTTY for Windows SSH, and Microsoft Remote Desktop for Windows RDP).
+Launch failures display a native error dialog, including when no client window is open.
+
+Keep new renderer code runtime-neutral. Add native behavior to the preload/main
+bridge rather than enabling Node.js integration or importing Electron from Vue
+components.

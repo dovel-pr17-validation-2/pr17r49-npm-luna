@@ -1,0 +1,1315 @@
+<script setup lang="ts">
+import type { DesktopUnlistenFn } from "~/shared/desktop/bridge";
+import type { LangType, ThemePresetId, UserData } from "~/types/index";
+
+import { useClientCompatibility } from "~/composables/useClientCompatibility";
+import { useSettingManager } from "~/composables/useSettingManager";
+import {
+  closeCurrentSiteWorkspace,
+  confirmLeaveCurrentSiteSessions,
+  hasActiveWorkspaceSessions
+} from "~/composables/useSiteAccountSwitch";
+import { DARK_THEME_PRESETS, getThemePreset, LIGHT_THEME_PRESETS } from "~/composables/useThemePresets";
+import { desktopEmit, desktopInvoke, desktopListen, openDesktopAuthUrl } from "~/shared/desktop/bridge";
+import { useUserInfoStore } from "~/store/modules/userInfo";
+import { clientLoginExpiryMessage } from "~/utils/clientLoginPolicy";
+import RecentSites from "./recentSites.vue";
+
+const recentSiteLimit = 5;
+const loginFailureToastId = "login-failed";
+
+const { addErrorToast } = useErrorToast();
+const appConfig = useAppConfig();
+const localePath = useLocalePath();
+const userInfoStore = useUserInfoStore();
+
+const { t, locales, locale } = useI18n();
+const { lock: lockWebSession, state: webLockState } = useWebSessionLock();
+const shortcuts = useAppShortcuts();
+const { loggedIn, currentAccountId, userMap, currentUser } = storeToRefs(userInfoStore);
+const { applyLoginPayload } = useAuthSession();
+const { openSettings } = useSettingsWindow();
+const {
+  currentAppearanceMode,
+  applyAppearanceMode,
+  currentThemePresetId,
+  currentThemePresetLabel,
+  selectThemePreset,
+  themePresetLabel
+} = useThemeOptions();
+
+const {
+  primaryColorLight,
+  primaryColorDark,
+  recentSites,
+  setRecentSites,
+  hydrationPromise,
+  setLang,
+  setLightThemePreset,
+  setDarkThemePreset,
+  setPrimaryColorLight,
+  setPrimaryColorDark
+} = useSettingManager();
+const { userTheme, isThemeRevealActive } = useThemeAdapter();
+const { applyPrimaryColor } = useColor();
+
+const inputSite = ref("");
+const inputSiteName = ref("");
+const siteNameEdited = ref(false);
+const editingAccountId = ref("");
+const expiredLoginReason = computed(() => {
+  const account = userMap.value[editingAccountId.value];
+  if (!account?.sessionExpired) return "";
+  const message = clientLoginExpiryMessage(
+    account.sessionExpiredReason,
+    account.clientLoginPolicy,
+    account.clientLoginSession,
+    locale.value
+  );
+  return message ? t(message.key, message.params) : "";
+});
+const errorMessage = ref("");
+const loginBtn = ref(false);
+const openModal = ref(false);
+const addingSite = ref(false);
+const hasValidationError = ref(false);
+const validationField = ref<"site" | "name" | null>(null);
+const recentSitesDismissed = ref(false);
+const unlistenAuthUrlRef = ref<DesktopUnlistenFn | null>(null);
+const unlistenErrorPageRef = ref<DesktopUnlistenFn | null>(null);
+const unlistenLoginFailedRef = ref<DesktopUnlistenFn | null>(null);
+const inputRef = ref<ComponentPublicInstance | null>(null);
+const siteNameInputRef = ref<ComponentPublicInstance | null>(null);
+const profileOpen = ref(false);
+const profileOpenedByPointer = ref(false);
+const downloadCenterUrl = computed(() =>
+  import.meta.client ? withWebSitePrefix("/core/download/") : "/core/download/"
+);
+const headerIconButtonClass =
+  "grid size-6 shrink-0 place-items-center rounded-[length:var(--app-radius)] p-0 text-[var(--app-text-secondary)] transition-colors hover:bg-[var(--app-hover-soft)] hover:text-[var(--app-fg)]";
+const headerIconButtonActiveClass = "bg-[var(--app-hover-soft)] text-[var(--app-fg)]";
+
+let loginBtnUnlockTimer: ReturnType<typeof setTimeout> | null = null;
+let desktopListenersActive = true;
+let loginRequestGeneration = 0;
+let loginInFlight = false;
+
+const retainDesktopListener = (target: typeof unlistenAuthUrlRef, unlisten: DesktopUnlistenFn) => {
+  if (!desktopListenersActive) {
+    unlisten();
+    return false;
+  }
+  target.value = unlisten;
+  return true;
+};
+
+useEventBus().on("login", (request) => openLoginPage(request?.accountId));
+
+const normalizedInputSite = computed(() => normalizeSite(inputSite.value));
+const normalizedInputSiteName = computed(() => inputSiteName.value.trim());
+
+const normalizedRecentSites = computed(() => {
+  const raw = Array.isArray(recentSites.value) ? recentSites.value : [];
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+
+  for (const site of raw) {
+    const value = normalizeSite(site);
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    normalized.push(value);
+    if (normalized.length >= recentSiteLimit) break;
+  }
+
+  return normalized;
+});
+
+const filteredRecentSites = computed(() => {
+  const query = normalizeSite(inputSite.value).toLowerCase();
+  const list = normalizedRecentSites.value;
+  if (!query) return list;
+
+  return list.filter((site) => site.toLowerCase().includes(query));
+});
+
+const showRecentSites = computed(
+  () => openModal.value && !recentSitesDismissed.value && filteredRecentSites.value.length > 0
+);
+
+const clearLoginBtnUnlockTimer = () => {
+  if (loginBtnUnlockTimer) {
+    clearTimeout(loginBtnUnlockTimer);
+    loginBtnUnlockTimer = null;
+  }
+};
+
+watch(normalizedInputSite, () => {
+  loginRequestGeneration += 1;
+  if (!loginInFlight) return;
+  loginInFlight = false;
+  loginBtn.value = false;
+  clearLoginBtnUnlockTimer();
+  void desktopInvoke("auth_cancel").catch((error) => console.debug("auth_cancel failed", error));
+});
+
+const enableLoginBtnAfter = (ms: number) => {
+  clearLoginBtnUnlockTimer();
+
+  loginBtnUnlockTimer = setTimeout(() => {
+    loginBtn.value = false;
+    loginBtnUnlockTimer = null;
+  }, ms);
+};
+
+const accountTooltip = computed(() => {
+  if (!loggedIn.value) return t("Common.More");
+  if (loggedIn.value && currentUser.value?.name) return currentUser.value.name;
+  return t("Common.Account");
+});
+
+const accountSite = computed(() => currentUser.value?.siteName || currentUser.value?.site || "—");
+
+const languageItems = computed(() =>
+  ((locales.value as Array<{ code?: string; name?: string } | string>) || []).map((item) => {
+    const id = typeof item === "string" ? item : item.code || "";
+    const label = typeof item === "string" ? item : item.name || id;
+    return { id, label };
+  })
+);
+
+const currentLanguageLabel = computed(
+  () => languageItems.value.find((item) => item.id === locale.value)?.label || locale.value
+);
+const primaryLanguageItems = computed(() =>
+  ["zh", "en"]
+    .map((id) => languageItems.value.find((item) => item.id === id))
+    .filter((item): item is { id: string; label: string } => Boolean(item))
+);
+const extraLanguageItems = computed(() => languageItems.value.filter((item) => item.id !== "zh" && item.id !== "en"));
+const extraLanguageLabel = computed(
+  () => extraLanguageItems.value.find((item) => item.id === locale.value)?.label || ""
+);
+const selectedPrimaryLanguage = computed({
+  get: () => locale.value,
+  set: (id: string) => setLang(id as LangType)
+});
+const moreLanguagesOpen = ref(false);
+const selectExtraLanguage = (id: string) => {
+  setLang(id as LangType);
+  moreLanguagesOpen.value = false;
+};
+
+const appearanceModes = computed(() => [
+  { id: "withSystem" as const, label: t("Common.System") },
+  { id: "light" as const, label: t("Common.Light") },
+  { id: "dark" as const, label: t("Common.Dark") }
+]);
+
+const themeRevealOrigin = ref<{ x: number; y: number } | null>(null);
+
+const selectedAppearanceMode = computed({
+  get: () => currentAppearanceMode.value,
+  set: (mode: "withSystem" | "light" | "dark") => {
+    void applyAppearanceMode(mode, themeRevealOrigin.value);
+  }
+});
+
+const onThemePointerDown = (event: PointerEvent) => {
+  themeRevealOrigin.value = { x: event.clientX, y: event.clientY };
+};
+
+const currentAppearanceLabel = computed(
+  () => appearanceModes.value.find((item) => item.id === currentAppearanceMode.value)?.label || ""
+);
+
+const menuTabsUi = {
+  root: "w-full",
+  list: "w-full rounded-[length:var(--app-radius)] bg-[var(--app-surface-panel)] p-1 ring-1 ring-[var(--app-border)]",
+  indicator: "rounded-[length:var(--app-radius)] bg-[var(--app-state-hover-strong)] shadow-none",
+  trigger:
+    "flex-1 rounded-[length:var(--app-radius)] px-3 data-[state=inactive]:text-[var(--app-text-secondary)] data-[state=active]:text-highlighted focus-visible:outline-[var(--app-focus-ring)]"
+};
+
+const menuSeparatorUi = {
+  border: "border-t border-[var(--app-border-soft)]"
+};
+
+const menuShortcutButtonUi = {
+  label: "min-w-0 flex-1 truncate text-left"
+};
+
+const currentThemeAccent = computed(() => {
+  const preset = getThemePreset(currentThemePresetId.value);
+  return preset?.baseColor || preset?.accent || "var(--theme-accent)";
+});
+const themePaletteOpen = ref(false);
+const previewedThemePresetId = ref<ThemePresetId | null>(null);
+const palettePreviewArmed = ref(false);
+const PALETTE_PREVIEW_DELAY_MS = 300;
+let palettePreviewArmFrame = 0;
+let palettePreviewTimer: ReturnType<typeof setTimeout> | null = null;
+
+const resolvedPaletteMode = computed<"light" | "dark">(() => {
+  if (currentAppearanceMode.value === "light") return "light";
+  if (currentAppearanceMode.value === "dark") return "dark";
+  return userTheme.value === "dark" ? "dark" : "light";
+});
+
+const visibleThemePresets = computed(() =>
+  resolvedPaletteMode.value === "dark" ? DARK_THEME_PRESETS : LIGHT_THEME_PRESETS
+);
+
+const handleProfileOpenAutoFocus = (event: Event) => {
+  if (profileOpenedByPointer.value) event.preventDefault();
+  profileOpenedByPointer.value = false;
+};
+
+const handlePaletteOpenAutoFocus = (event: Event) => {
+  event.preventDefault();
+};
+
+const handleProfileInteractOutside = (event: Event) => {
+  const nested = event
+    .composedPath()
+    .some((node) => node instanceof Element && node.hasAttribute("data-profile-nested-popover"));
+  if (nested || isThemeRevealActive()) event.preventDefault();
+};
+
+const handlePaletteInteractOutside = (event: Event) => {
+  if (isThemeRevealActive()) event.preventDefault();
+};
+
+const cancelPalettePreviewArm = () => {
+  if (!palettePreviewArmFrame) return;
+  cancelAnimationFrame(palettePreviewArmFrame);
+  palettePreviewArmFrame = 0;
+};
+
+const cancelPalettePreviewTimer = () => {
+  if (!palettePreviewTimer) return;
+  clearTimeout(palettePreviewTimer);
+  palettePreviewTimer = null;
+};
+
+const disarmPalettePreview = () => {
+  cancelPalettePreviewArm();
+  cancelPalettePreviewTimer();
+  palettePreviewArmed.value = false;
+};
+
+const armPalettePreview = () => {
+  cancelPalettePreviewArm();
+  palettePreviewArmed.value = true;
+};
+
+watch(profileOpen, (open) => {
+  if (!open) {
+    themePaletteOpen.value = false;
+    restorePalettePreview();
+  }
+});
+
+watch(themePaletteOpen, (open) => {
+  if (!open) {
+    disarmPalettePreview();
+    restorePalettePreview();
+    return;
+  }
+
+  disarmPalettePreview();
+  palettePreviewArmFrame = requestAnimationFrame(() => {
+    palettePreviewArmFrame = requestAnimationFrame(() => {
+      palettePreviewArmFrame = 0;
+      if (themePaletteOpen.value) palettePreviewArmed.value = true;
+    });
+  });
+});
+
+const previewPalettePreset = (id: ThemePresetId) => {
+  if (!palettePreviewArmed.value) return;
+  if (previewedThemePresetId.value === id) {
+    cancelPalettePreviewTimer();
+    return;
+  }
+
+  cancelPalettePreviewTimer();
+  palettePreviewTimer = setTimeout(() => {
+    palettePreviewTimer = null;
+    if (!palettePreviewArmed.value || !themePaletteOpen.value) return;
+
+    const preset = getThemePreset(id);
+    if (!preset || !import.meta.client) return;
+
+    previewedThemePresetId.value = id;
+    document.documentElement.dataset.themePreset = id;
+    applyPrimaryColor(preset.accent);
+  }, PALETTE_PREVIEW_DELAY_MS);
+};
+
+function restorePalettePreview() {
+  cancelPalettePreviewTimer();
+  if (!previewedThemePresetId.value || !import.meta.client) return;
+
+  previewedThemePresetId.value = null;
+  document.documentElement.dataset.themePreset = currentThemePresetId.value;
+  applyCurrentThemeColor();
+}
+
+const applyPalettePreset = (id: ThemePresetId) => {
+  const preset = getThemePreset(id);
+  if (!preset || isThemeRevealActive()) return;
+
+  restorePalettePreview();
+
+  if (currentAppearanceMode.value !== "withSystem") {
+    selectThemePreset(id);
+    return;
+  }
+
+  applyPrimaryColor(preset.accent);
+  if (resolvedPaletteMode.value === "dark") {
+    setDarkThemePreset(id);
+    setPrimaryColorDark(preset.accent);
+  } else {
+    setLightThemePreset(id);
+    setPrimaryColorLight(preset.accent);
+  }
+
+  try {
+    void desktopEmit("primary-color-changed", { hex: preset.accent, mode: resolvedPaletteMode.value });
+  } catch {}
+};
+
+watch(
+  () => userTheme.value,
+  () => {
+    applyCurrentThemeColor();
+  }
+);
+
+function applyCurrentThemeColor(broadcast = false) {
+  const modeNow = (userTheme.value as string) || "light";
+  const hexNow = modeNow === "dark" ? primaryColorDark.value : primaryColorLight.value;
+
+  if (hexNow) {
+    applyPrimaryColor(hexNow);
+    if (broadcast) {
+      void desktopEmit("primary-color-changed", { hex: hexNow, mode: modeNow });
+    }
+  }
+}
+
+/**
+ * @description 标准化站点输入：去除首尾空格 + 去除末尾斜杠
+ * @param value 站点输入
+ * @returns 标准化后的站点
+ */
+function normalizeSite(value: string): string {
+  const s = (value || "").trim();
+  if (!s) return "";
+  return s.replace(/\/+$/, "");
+}
+
+function getDefaultSiteName(value: string): string {
+  const normalized = normalizeSite(value);
+  if (!normalized) return "";
+
+  try {
+    return new URL(normalized).hostname || normalized;
+  } catch {
+    const withoutScheme = normalized.replace(/^[a-z][a-z\d+.-]*:\/\//i, "");
+    const authority = withoutScheme.split(/[/?#]/, 1)[0] || "";
+    const host = authority.includes("@") ? authority.split("@").pop() || authority : authority;
+
+    if (!host) return normalized;
+
+    const ipv6Match = host.match(/^\[([^\]]+)\](?::\d+)?$/);
+    if (ipv6Match) return ipv6Match[1] || normalized;
+
+    return host.replace(/:\d+$/, "");
+  }
+}
+
+const ensureRecentSitesReady = async () => {
+  if (hydrationPromise.value) {
+    await hydrationPromise.value;
+  }
+};
+
+const saveRecentSite = async (site: string) => {
+  try {
+    const normalized = normalizeSite(site);
+    if (!normalized) return;
+
+    await ensureRecentSitesReady();
+    const next = [normalized, ...normalizedRecentSites.value.filter((item) => item !== normalized)].slice(
+      0,
+      recentSiteLimit
+    );
+    setRecentSites(next);
+  } catch (err) {
+    console.error("save recent sites failed", err);
+  }
+};
+
+const removeRecentSite = async (site: string) => {
+  try {
+    const normalized = normalizeSite(site);
+    if (!normalized) return;
+
+    await ensureRecentSitesReady();
+    const next = normalizedRecentSites.value.filter((item) => item !== normalized);
+    setRecentSites(next);
+  } catch (err) {
+    console.error("remove recent site failed", err);
+  }
+};
+
+const clearRecentSites = async () => {
+  try {
+    await ensureRecentSitesReady();
+    setRecentSites([]);
+  } catch (err) {
+    console.error("clear recent sites failed", err);
+  }
+};
+
+const selectRecentSite = (site: string) => {
+  inputSite.value = site;
+  inputSiteName.value = getDefaultSiteName(site);
+  siteNameEdited.value = false;
+  clearValidationError();
+  recentSitesDismissed.value = true;
+  nextTick(() => {
+    inputRef.value?.$el?.querySelector("input")?.focus();
+  });
+};
+
+const handleClearInput = () => {
+  inputSite.value = "";
+  if (!siteNameEdited.value) inputSiteName.value = "";
+  clearValidationError();
+  recentSitesDismissed.value = false;
+};
+
+/**
+ * @description 打开登录页面
+ */
+function openLoginPage(accountId?: string) {
+  profileOpen.value = false;
+
+  if (!isDesktopRuntime()) {
+    redirectToWebLogin();
+    return;
+  }
+
+  addingSite.value = accountId === "";
+  const reauthAccountId =
+    accountId ?? (!loggedIn.value ? currentAccountId.value || Object.keys(userMap.value)[0] || "" : "");
+  const reauthUser = userMap.value[reauthAccountId];
+  if (reauthUser && !loggedIn.value) userInfoStore.selectAccountForLogin(reauthAccountId);
+  editingAccountId.value = reauthUser ? reauthAccountId : "";
+  inputSite.value = reauthUser?.site || "";
+  inputSiteName.value = reauthUser?.siteName || reauthUser?.site || "";
+  siteNameEdited.value = Boolean(reauthUser);
+  openModal.value = true;
+  recentSitesDismissed.value = false;
+  hasValidationError.value = false;
+  validationField.value = null;
+  errorMessage.value = "";
+  nextTick(() => {
+    inputRef.value?.$el.querySelector("input")?.focus();
+  });
+}
+
+/**
+ * @description 清除验证错误
+ */
+function clearValidationError() {
+  if (hasValidationError.value) {
+    hasValidationError.value = false;
+    validationField.value = null;
+    errorMessage.value = "";
+  }
+}
+
+/**
+ * @description 清除认证信息
+ */
+async function clearAuthInfo() {
+  profileOpen.value = false;
+  if (!(await confirmLeaveCurrentSiteSessions("logout"))) return;
+  if (!isDesktopRuntime()) {
+    redirectToWebLogout();
+    return;
+  }
+  await userInfoStore.deleteUserData(currentAccountId.value);
+  if (loggedIn.value) return;
+  await navigateTo(localePath({ path: "/" }));
+}
+
+async function lockCurrentSession() {
+  profileOpen.value = false;
+  try {
+    if (isDesktopRuntime()) await desktopInvoke("client_lock");
+    else await lockWebSession();
+  } catch (error) {
+    addErrorToast({ title: t("ClientLock.LoadFailed"), error });
+  }
+}
+
+function openAddSite() {
+  profileOpen.value = false;
+  openLoginPage("");
+}
+
+async function openUserSettings() {
+  profileOpen.value = false;
+  await openSettings("/setting/user");
+}
+
+async function openPreferences() {
+  profileOpen.value = false;
+  await openSettings();
+}
+
+async function openTools() {
+  profileOpen.value = false;
+  await navigateTo(localePath("videoplayer"));
+}
+
+/**
+ * @description 过滤输入中的控制字符
+ */
+// oxlint-disable-next-line no-control-regex
+const sanitizeInput = (value: string) => value.replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+
+/**
+ * @description 输入事件处理：移除控制字符，并保持光标位置
+ * 移除控制字符后，用“移除前的长度差”修正光标，保证左右键仍可正常移动
+ */
+const handleInputSanitize = (event: Event) => {
+  const target = event.target as HTMLInputElement | null;
+
+  if (!target) return;
+
+  const raw = target.value;
+  const caret = target.selectionStart ?? raw.length;
+
+  const sanitized = sanitizeInput(raw);
+
+  if (sanitized !== raw) {
+    const beforeCaretRaw = raw.slice(0, caret);
+    const beforeCaretSanitized = sanitizeInput(beforeCaretRaw);
+    const removedBeforeCaret = beforeCaretRaw.length - beforeCaretSanitized.length;
+
+    target.value = sanitized;
+
+    const newCaret = Math.max(0, caret - removedBeforeCaret);
+    target.setSelectionRange(newCaret, newCaret);
+  }
+
+  inputSite.value = sanitized;
+  if (!siteNameEdited.value) {
+    inputSiteName.value = getDefaultSiteName(sanitized);
+  }
+  recentSitesDismissed.value = false;
+  clearValidationError();
+};
+
+const handleSiteNameInputSanitize = (event: Event) => {
+  const target = event.target as HTMLInputElement | null;
+  if (!target) return;
+
+  const sanitized = sanitizeInput(target.value);
+  if (sanitized !== target.value) target.value = sanitized;
+
+  inputSiteName.value = sanitized;
+  siteNameEdited.value = true;
+  clearValidationError();
+};
+
+/**
+ * @description 处理剪贴板输入
+ * @param value 剪贴板输入
+ */
+const handleClipboard = (value: string) => {
+  inputSite.value = normalizeSite(value);
+  if (!siteNameEdited.value) inputSiteName.value = getDefaultSiteName(inputSite.value);
+  recentSitesDismissed.value = false;
+};
+
+/**
+ * @description 处理确认输入
+ */
+const handleConfirm = async (confirmation?: { id: number; accountId: string; generation: number }) => {
+  if (loginBtn.value || (confirmation && confirmation.generation !== loginRequestGeneration)) return;
+
+  errorMessage.value = "";
+  hasValidationError.value = false;
+  validationField.value = null;
+
+  const normalizedSite = normalizedInputSite.value;
+  const siteName = normalizedInputSiteName.value;
+  const urlRegExp = appConfig.componentsConfig.urlRegExp;
+
+  if (!normalizedSite) {
+    hasValidationError.value = true;
+    validationField.value = "site";
+    errorMessage.value = t("Login.EmptyUrlError");
+
+    nextTick(() => {
+      inputRef.value?.$el?.querySelector("input")?.focus();
+    });
+
+    return;
+  }
+
+  if (!siteName) {
+    hasValidationError.value = true;
+    validationField.value = "name";
+    errorMessage.value = t("Login.EmptySiteNameError");
+    nextTick(() => {
+      siteNameInputRef.value?.$el?.querySelector("input")?.focus();
+    });
+    return;
+  }
+
+  const duplicateName = (Object.entries(userMap.value) as [string, UserData][]).some(
+    ([accountId, user]) =>
+      accountId !== editingAccountId.value && user.siteName.trim().toLowerCase() === siteName.toLowerCase()
+  );
+
+  if (duplicateName) {
+    hasValidationError.value = true;
+    validationField.value = "name";
+    errorMessage.value = t("Login.DuplicateSiteNameError");
+    nextTick(() => {
+      siteNameInputRef.value?.$el?.querySelector("input")?.focus();
+    });
+    return;
+  }
+
+  if (!urlRegExp.test(normalizedSite)) {
+    hasValidationError.value = true;
+    validationField.value = "site";
+    errorMessage.value = t("Login.InvalidUrlError");
+
+    nextTick(() => {
+      inputRef.value?.$el?.querySelector("input")?.focus();
+    });
+
+    return;
+  }
+
+  if (!isDesktopRuntime()) {
+    redirectToWebLogin();
+    return;
+  }
+
+  const isReauth = Boolean(editingAccountId.value && editingAccountId.value === currentAccountId.value);
+  const leavingCurrentSite = loggedIn.value && !isReauth;
+  const generation = confirmation?.generation ?? ++loginRequestGeneration;
+  if (leavingCurrentSite && !confirmation && !(await confirmLeaveCurrentSiteSessions("login", { close: false })))
+    return;
+  if (generation !== loginRequestGeneration) return;
+
+  try {
+    clearLoginBtnUnlockTimer();
+    loginBtn.value = true;
+    loginInFlight = true;
+    const accountId = confirmation?.accountId || editingAccountId.value || globalThis.crypto.randomUUID();
+    useClientCompatibility().dismiss();
+    const payload = await desktopInvoke<any>("auth_login", {
+      site: normalizedSite,
+      sessionId: accountId,
+      compatibilityConfirmationId: confirmation?.id
+    });
+    if (generation !== loginRequestGeneration) return;
+    if (payload?.status === "confirmation-required" && payload.compatibility) {
+      const { status, reason } = payload.compatibility;
+      if (status === "unknown" && (reason === "network" || reason === "timeout")) {
+        hasValidationError.value = true;
+        validationField.value = "site";
+        errorMessage.value = t("Login.InvalidSiteError");
+        return;
+      }
+      openModal.value = false;
+      loginBtn.value = false;
+      useClientCompatibility().show(payload.compatibility, async () => {
+        if (generation !== loginRequestGeneration) return;
+        openModal.value = true;
+        await handleConfirm({ id: payload.compatibility_confirmation_id, accountId, generation });
+      });
+      return;
+    }
+    if (!payload || payload.status !== "success") {
+      if (payload && payload.status !== "stale") throw new Error(t("Login.LoginFailed"));
+      return;
+    }
+    if (leavingCurrentSite) await closeCurrentSiteWorkspace();
+    if (generation !== loginRequestGeneration) return;
+    if (!(await applyLoginPayload(payload, { showToast: true, navigateHome: true, accountId, siteName }))) {
+      throw new Error(t("Login.LoginFailed"));
+    }
+    void saveRecentSite(normalizedSite);
+  } catch (e: any) {
+    if (generation !== loginRequestGeneration) return;
+    const raw = (e?.message || e || "").toString();
+    const looksLikeSiteIssue = [
+      "Failed to fetch OAuth config",
+      "OAuth config endpoint returned",
+      "Failed to parse OAuth config JSON",
+      "Failed to read response body"
+    ].some((needle) => raw.includes(needle));
+
+    hasValidationError.value = true;
+    validationField.value = "site";
+    errorMessage.value = looksLikeSiteIssue ? t("Login.InvalidSiteError") : raw || t("Login.LoginFailed");
+
+    if (!looksLikeSiteIssue) {
+      addErrorToast({
+        id: loginFailureToastId,
+        title: t("Login.LoginFailed"),
+        description: raw || t("Login.LoginFailed"),
+        icon: "line-md:close-circle",
+        progress: true,
+        duration: 4000
+      });
+    }
+
+    nextTick(() => {
+      inputRef.value?.$el?.querySelector("input")?.focus();
+    });
+  } finally {
+    if (generation === loginRequestGeneration) {
+      loginInFlight = false;
+      clearLoginBtnUnlockTimer();
+      loginBtn.value = false;
+    }
+  }
+};
+
+onMounted(async () => {
+  desktopListenersActive = true;
+  applyCurrentThemeColor();
+
+  if (!isDesktopRuntime()) return;
+
+  const unlistenAuthUrl = await desktopListen("auth_url", (event) => {
+    const url = (event?.payload || "").toString();
+    if (!url) return;
+
+    clearLoginBtnUnlockTimer();
+    loginBtn.value = false;
+    openModal.value = false;
+    // The auth layout replaces the workspace and disconnects its transports.
+    // Keep live sessions mounted while the existing browser flow authenticates.
+    if (hasActiveWorkspaceSessions()) {
+      void openDesktopAuthUrl(url);
+      return;
+    }
+    navigateTo({ path: localePath({ path: "/auth/browser" }), query: { auth_url: url } });
+  });
+  if (!retainDesktopListener(unlistenAuthUrlRef, unlistenAuthUrl)) return;
+
+  const unlistenErrorPage = await desktopListen("error-page", (event) => {
+    const payload = (event?.payload || {}) as any;
+    const status = (payload?.status || "").toString();
+    const reason = (payload?.reason || "").toString();
+    const message = (payload?.message || "").toString();
+
+    if (status !== "failure") return;
+
+    let description = message || t("Login.LoginFailedErrorPage");
+
+    if (reason === "invalid-site") {
+      description = t("Login.InvalidSiteError");
+    }
+
+    addErrorToast({
+      id: loginFailureToastId,
+      title: reason === "invalid-site" ? description : t("Login.LoginFailed"),
+      description: reason === "invalid-site" ? undefined : description,
+      icon: "line-md:close-circle",
+      progress: true,
+      duration: 4000
+    });
+    enableLoginBtnAfter(2000);
+
+    if (reason === "invalid-site") {
+      hasValidationError.value = true;
+      validationField.value = "site";
+      errorMessage.value = t("Login.InvalidSiteError");
+
+      nextTick(() => {
+        inputRef.value?.$el?.querySelector("input")?.focus();
+      });
+    }
+  });
+  if (!retainDesktopListener(unlistenErrorPageRef, unlistenErrorPage)) return;
+
+  const unlistenLoginFailed = await desktopListen("login-failed-detected", (event) => {
+    const payload = (event?.payload || {}) as any;
+    const reason = (payload?.reason || "").toString();
+    const message = (payload?.message || "").toString();
+
+    let description = message || t("Login.LoginFailedDescription");
+
+    if (reason === "invalid-site") {
+      description = t("Login.InvalidSiteError");
+    }
+
+    addErrorToast({
+      id: loginFailureToastId,
+      title: reason === "invalid-site" ? description : t("Login.LoginFailed"),
+      description: reason === "invalid-site" ? undefined : description,
+      icon: "line-md:close-circle",
+      progress: true,
+      duration: 4000
+    });
+
+    enableLoginBtnAfter(2000);
+
+    if (reason === "invalid-site") {
+      hasValidationError.value = true;
+      validationField.value = "site";
+      errorMessage.value = t("Login.InvalidSiteError");
+
+      nextTick(() => {
+        inputRef.value?.$el?.querySelector("input")?.focus();
+      });
+    }
+  });
+  retainDesktopListener(unlistenLoginFailedRef, unlistenLoginFailed);
+});
+
+onBeforeUnmount(() => {
+  desktopListenersActive = false;
+  disarmPalettePreview();
+  restorePalettePreview();
+  if (unlistenAuthUrlRef.value) unlistenAuthUrlRef.value();
+  if (unlistenErrorPageRef.value) unlistenErrorPageRef.value();
+  if (unlistenLoginFailedRef.value) unlistenLoginFailedRef.value();
+  clearLoginBtnUnlockTimer();
+});
+</script>
+
+<template>
+  <UPopover
+    v-model:open="profileOpen"
+    :content="{
+      align: 'end',
+      side: 'bottom',
+      sideOffset: 8,
+      onOpenAutoFocus: handleProfileOpenAutoFocus,
+      onInteractOutside: handleProfileInteractOutside
+    }"
+    :ui="{
+      content:
+        'max-h-[calc(100dvh-4rem)] w-64 overflow-x-hidden overflow-y-auto rounded-[length:var(--app-radius)] bg-[var(--app-surface-overlay)] p-0 shadow-[var(--theme-shadow-soft)] ring-1 ring-[var(--app-border)] backdrop-blur-md'
+    }"
+  >
+    <UTooltip arrow :text="accountTooltip">
+      <UButton
+        color="neutral"
+        variant="ghost"
+        size="xs"
+        square
+        :aria-label="accountTooltip"
+        :class="[headerIconButtonClass, profileOpen ? headerIconButtonActiveClass : '']"
+        @pointerdown="profileOpenedByPointer = true"
+        @keydown="profileOpenedByPointer = false"
+      >
+        <UIcon :name="loggedIn ? 'i-lucide-circle-user-round' : 'i-lucide-menu'" class="size-4" />
+      </UButton>
+    </UTooltip>
+
+    <template #content>
+      <div class="w-full">
+        <template v-if="loggedIn">
+          <UButton
+            color="neutral"
+            variant="ghost"
+            block
+            class="h-auto items-center justify-start gap-3 rounded-none rounded-t-[length:var(--app-radius)] px-3 py-3 text-left"
+            :ui="{ base: 'rounded-none rounded-t-[length:var(--app-radius)]' }"
+            @click="openUserSettings"
+          >
+            <UAvatar :alt="currentUser?.name || t('Common.User')" color="primary" size="md" class="shrink-0" />
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-sm font-semibold text-highlighted">
+                {{ currentUser?.name || t("Common.User") }}
+              </span>
+              <span class="mt-0.5 block truncate text-xs font-normal text-muted" :title="accountSite">
+                {{ accountSite }}
+              </span>
+            </span>
+            <UIcon name="i-lucide-chevron-right" class="size-4 shrink-0 text-dimmed" />
+          </UButton>
+        </template>
+
+        <div v-else class="p-1.5">
+          <UButton
+            :label="t('Common.Login')"
+            icon="i-lucide-log-in"
+            color="primary"
+            variant="soft"
+            size="sm"
+            block
+            class="justify-start"
+            @click="openLoginPage()"
+          />
+        </div>
+
+        <div class="px-2">
+          <USeparator :ui="menuSeparatorUi" />
+        </div>
+        <div class="space-y-2.5 p-2">
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-2 px-1 text-[11px] font-medium text-muted">
+              <UIcon name="i-lucide-languages" class="size-3.5" />
+              <span>{{ t("Common.Language") }}</span>
+              <span class="ms-auto text-[11px] font-normal text-muted">{{ currentLanguageLabel }}</span>
+            </div>
+            <UTabs
+              v-model="selectedPrimaryLanguage"
+              :items="primaryLanguageItems"
+              value-key="id"
+              :content="false"
+              color="neutral"
+              variant="pill"
+              size="xs"
+              :ui="menuTabsUi"
+            />
+            <UPopover
+              v-if="extraLanguageItems.length"
+              v-model:open="moreLanguagesOpen"
+              :content="{ align: 'start', side: 'left', sideOffset: 8 }"
+              :ui="{
+                content:
+                  'w-56 max-h-80 overflow-y-auto rounded-[length:var(--app-radius)] bg-[var(--app-surface-overlay)] p-1.5 shadow-[var(--theme-shadow-soft)] ring-1 ring-[var(--app-border)] backdrop-blur-md'
+              }"
+            >
+              <UButton color="neutral" variant="ghost" size="sm" block class="h-8 justify-start gap-2 px-2">
+                <span class="min-w-0 flex-1 truncate text-left text-xs">{{ t("Common.More") }}</span>
+                <span class="text-[10px] text-muted">{{ extraLanguageLabel }}</span>
+                <UIcon name="i-lucide-chevron-right" class="size-3.5 shrink-0 text-muted" />
+              </UButton>
+
+              <template #content>
+                <div data-profile-nested-popover class="space-y-0.5">
+                  <UButton
+                    v-for="item in extraLanguageItems"
+                    :key="item.id"
+                    color="neutral"
+                    variant="ghost"
+                    size="sm"
+                    block
+                    class="justify-start gap-2"
+                    @click="selectExtraLanguage(item.id)"
+                  >
+                    <span class="min-w-0 flex-1 truncate text-left text-xs">{{ item.label }}</span>
+                    <UIcon v-if="locale === item.id" name="i-lucide-check" class="size-3.5 shrink-0 text-primary" />
+                  </UButton>
+                </div>
+              </template>
+            </UPopover>
+          </div>
+
+          <div class="space-y-1.5">
+            <div class="flex items-center gap-2 px-1 text-[11px] font-medium text-muted">
+              <UIcon name="i-lucide-palette" class="size-3.5" />
+              <span>{{ t("Common.Theme") }}</span>
+              <span class="ms-auto text-[11px] font-normal text-muted">{{ currentAppearanceLabel }}</span>
+            </div>
+            <div @pointerdown="onThemePointerDown">
+              <UTabs
+                v-model="selectedAppearanceMode"
+                :items="appearanceModes"
+                value-key="id"
+                :content="false"
+                color="neutral"
+                variant="pill"
+                size="xs"
+                :ui="menuTabsUi"
+              />
+            </div>
+            <UPopover
+              v-model:open="themePaletteOpen"
+              :content="{
+                align: 'start',
+                side: 'left',
+                sideOffset: 8,
+                onOpenAutoFocus: handlePaletteOpenAutoFocus,
+                onInteractOutside: handlePaletteInteractOutside
+              }"
+              :ui="{
+                content:
+                  'w-56 max-h-80 overflow-y-auto rounded-[length:var(--app-radius)] bg-[var(--app-surface-overlay)] p-1.5 shadow-[var(--theme-shadow-soft)] ring-1 ring-[var(--app-border)] backdrop-blur-md'
+              }"
+            >
+              <UButton color="neutral" variant="ghost" size="sm" block class="h-8 justify-start gap-2 px-2">
+                <span
+                  class="size-2.5 shrink-0 rounded-full ring-1 ring-(--app-border)"
+                  :style="{ backgroundColor: currentThemeAccent }"
+                />
+                <span class="min-w-0 flex-1 truncate text-left text-xs">{{ currentThemePresetLabel }}</span>
+                <span class="text-[10px] text-muted">{{ t("Common.Appearance") }}</span>
+                <UIcon name="i-lucide-chevron-right" class="size-3.5 shrink-0 text-muted" />
+              </UButton>
+
+              <template #content>
+                <div
+                  data-profile-nested-popover
+                  class="space-y-0.5"
+                  @pointermove="armPalettePreview"
+                  @pointerleave="restorePalettePreview"
+                  @focusout="restorePalettePreview"
+                >
+                  <UButton
+                    v-for="item in visibleThemePresets"
+                    :key="item.id"
+                    color="neutral"
+                    variant="ghost"
+                    size="sm"
+                    block
+                    class="justify-start gap-2"
+                    @pointerenter="previewPalettePreset(item.id)"
+                    @focus="previewPalettePreset(item.id)"
+                    @click="applyPalettePreset(item.id)"
+                  >
+                    <span
+                      class="size-2.5 shrink-0 rounded-full ring-1 ring-(--app-border)"
+                      :style="{ backgroundColor: item.baseColor || item.accent }"
+                    />
+                    <span class="min-w-0 flex-1 truncate text-left text-xs">{{ themePresetLabel(item) }}</span>
+                    <UIcon
+                      v-if="currentThemePresetId === item.id"
+                      name="i-lucide-check"
+                      class="size-3.5 shrink-0 text-primary"
+                    />
+                  </UButton>
+                </div>
+              </template>
+            </UPopover>
+          </div>
+        </div>
+
+        <div class="px-2">
+          <USeparator :ui="menuSeparatorUi" />
+        </div>
+        <div class="p-1.5">
+          <UButton
+            :label="t('Common.Settings')"
+            icon="i-lucide-settings"
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            block
+            class="justify-start"
+            :ui="menuShortcutButtonUi"
+            @click="openPreferences"
+          >
+            <template #trailing>
+              <span class="ms-auto flex items-center gap-px">
+                <UKbd value="meta" size="sm" />
+                <UKbd value="," size="sm" />
+              </span>
+            </template>
+          </UButton>
+          <UButton
+            v-if="!isDesktopRuntime()"
+            :label="t('Setting.DownloadClient')"
+            icon="i-lucide-download"
+            :to="downloadCenterUrl"
+            external
+            target="_blank"
+            rel="noopener noreferrer"
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            block
+            class="justify-start"
+            @click="profileOpen = false"
+          />
+          <UButton
+            v-if="isDesktopRuntime()"
+            :label="t('Menu.MyTools')"
+            icon="i-lucide-wrench"
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            block
+            class="justify-start"
+            :ui="menuShortcutButtonUi"
+            @click="openTools"
+          >
+            <template #trailing>
+              <span class="ms-auto flex items-center gap-px">
+                <UKbd value="meta" size="sm" />
+                <UKbd value="shift" size="sm" />
+                <UKbd value="," size="sm" />
+              </span>
+            </template>
+          </UButton>
+          <UPopover
+            v-if="isDesktopRuntime()"
+            :content="{ align: 'start', side: 'left', sideOffset: 8 }"
+            :ui="{
+              content:
+                'w-72 max-w-[calc(100vw-2rem)] overflow-hidden rounded-[length:var(--app-radius)] bg-[var(--app-surface-overlay)] p-1.5 shadow-[var(--theme-shadow-soft)] ring-1 ring-[var(--app-border)] backdrop-blur-md'
+            }"
+          >
+            <UButton
+              :label="t('Login.SwitchSite')"
+              icon="i-lucide-arrow-left-right"
+              color="neutral"
+              variant="ghost"
+              size="sm"
+              block
+              class="justify-start"
+            >
+              <template #trailing>
+                <UIcon name="i-lucide-chevron-right" class="ms-auto size-3.5 shrink-0 text-muted" />
+              </template>
+            </UButton>
+
+            <template #content>
+              <div data-profile-nested-popover>
+                <SiteAccounts @select="profileOpen = false" />
+                <USeparator v-if="Object.keys(userMap).length" class="my-1.5" :ui="menuSeparatorUi" />
+                <UButton
+                  :label="t('Login.AddAccount')"
+                  icon="i-lucide-user-round-plus"
+                  color="neutral"
+                  variant="ghost"
+                  size="sm"
+                  block
+                  class="justify-start"
+                  @click="openAddSite"
+                />
+              </div>
+            </template>
+          </UPopover>
+        </div>
+
+        <div v-if="loggedIn" class="px-2">
+          <USeparator :ui="menuSeparatorUi" />
+        </div>
+        <div v-if="loggedIn" class="p-1.5">
+          <UButton
+            v-if="isDesktopRuntime() || webLockState.session"
+            :label="t('ScreenLock.LockNow')"
+            icon="i-lucide-lock-keyhole"
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            block
+            class="justify-start"
+            :ui="menuShortcutButtonUi"
+            @click="lockCurrentSession"
+          >
+            <template v-if="isDesktopRuntime() && shortcuts.kbds('lockClient').length" #trailing>
+              <span class="ms-auto flex items-center gap-px">
+                <UKbd v-for="(key, index) in shortcuts.kbds('lockClient')" :key="index" :value="key" size="sm" />
+              </span>
+            </template>
+          </UButton>
+          <USeparator v-if="isDesktopRuntime() || webLockState.session" class="my-1.5" :ui="menuSeparatorUi" />
+          <UButton
+            :label="t('Login.Logout')"
+            icon="i-lucide-log-out"
+            color="error"
+            variant="ghost"
+            size="sm"
+            block
+            class="justify-start"
+            @click="clearAuthInfo"
+          />
+        </div>
+      </div>
+    </template>
+  </UPopover>
+
+  <Modal
+    v-if="isDesktopRuntime()"
+    v-model:open="openModal"
+    :title="t(addingSite ? 'Login.AddAccount' : 'Login.Title')"
+    :disabled="loginBtn"
+    @update:open="openModal = $event"
+    @confirm="handleConfirm"
+    @clipboard="handleClipboard"
+  >
+    <div class="flex flex-col gap-6">
+      <UAlert
+        v-if="expiredLoginReason"
+        color="warning"
+        variant="soft"
+        icon="i-lucide-log-in"
+        :title="t('Login.SessionExpired')"
+        :description="expiredLoginReason"
+      />
+      <UInput
+        ref="inputRef"
+        v-model="inputSite"
+        :color="validationField === 'site' ? 'error' : 'primary'"
+        :ui="{ base: 'peer', leadingIcon: 'sidebar-icon', trailingIcon: 'sidebar-icon' }"
+        placeholder=" "
+        autocapitalize="none"
+        autocorrect="off"
+        @input="handleInputSanitize"
+      >
+        <label
+          class="pointer-events-none absolute left-0 -top-2.5 text-xs font-medium px-1.5 transition-all peer-focus:-top-2.5 peer-focus:text-xs peer-focus:font-medium peer-placeholder-shown:text-sm peer-placeholder-shown:top-1.5 peer-placeholder-shown:font-normal [&>span]:bg-[var(--app-surface-modal)] peer-placeholder-shown:not-peer-focus:[&>span]:bg-[var(--app-input-bg)]"
+        >
+          <span class="inline-flex px-1">
+            {{ t("Login.Description") }}
+          </span>
+        </label>
+
+        <template #trailing>
+          <UButton
+            v-if="normalizedInputSite?.length"
+            color="neutral"
+            variant="link"
+            size="sm"
+            icon="i-lucide-circle-x"
+            :aria-label="t('Common.ClearInput')"
+            :ui="{ leadingIcon: 'm-0 sidebar-icon' }"
+            @click="handleClearInput"
+          />
+        </template>
+      </UInput>
+
+      <UInput
+        ref="siteNameInputRef"
+        v-model="inputSiteName"
+        :color="validationField === 'name' ? 'error' : 'primary'"
+        :ui="{ base: 'peer', leadingIcon: 'sidebar-icon', trailingIcon: 'sidebar-icon' }"
+        placeholder=" "
+        @input="handleSiteNameInputSanitize"
+      >
+        <label
+          class="pointer-events-none absolute left-0 -top-2.5 text-xs font-medium px-1.5 transition-all peer-focus:-top-2.5 peer-focus:text-xs peer-focus:font-medium peer-placeholder-shown:text-sm peer-placeholder-shown:top-1.5 peer-placeholder-shown:font-normal [&>span]:bg-[var(--app-surface-modal)] peer-placeholder-shown:not-peer-focus:[&>span]:bg-[var(--app-input-bg)]"
+        >
+          <span class="inline-flex px-1">
+            {{ t("Login.SiteName") }}
+          </span>
+        </label>
+      </UInput>
+
+      <RecentSites
+        :visible="showRecentSites"
+        :sites="filteredRecentSites"
+        @select="selectRecentSite"
+        @remove="removeRecentSite"
+        @clear="clearRecentSites"
+      />
+
+      <div v-if="hasValidationError" role="alert" class="text-error text-xs px-1">
+        {{ errorMessage }}
+      </div>
+    </div>
+  </Modal>
+</template>

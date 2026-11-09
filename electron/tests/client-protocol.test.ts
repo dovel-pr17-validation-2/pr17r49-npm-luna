@@ -1,0 +1,691 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
+import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
+import { runInNewContext } from "node:vm";
+import test from "node:test";
+import ts from "typescript";
+import { ApplicationConfigService } from "../src/apps/application-config.ts";
+import {
+  CLIENT_AUTH_CALLBACK,
+  decodeClientProtocolPayload,
+  findClientProtocolUrl,
+  isWebAssetClientProtocolPayload,
+  normalizeClientProtocolUrl,
+  registerClientProtocol
+} from "../src/shared/client-protocol.ts";
+
+function loadTestDependency(require: NodeJS.Require, name: string) {
+  switch (name) {
+    case "../../../ui/utils/apiError":
+      return require("../../../ui/utils/apiError");
+    case "../package.json":
+      return require("../package.json");
+    case "../shared/client-protocol":
+      return require("../shared/client-protocol");
+    case "../shared/debug-log":
+      return require("../shared/debug-log");
+    case "../shared/url":
+      return require("../shared/url");
+    case "./oauth-callback":
+      return require("./oauth-callback");
+    case "./compatibility":
+      return require("./compatibility");
+    case "./shared/product-name":
+      return require("./shared/product-name");
+    case "node:child_process":
+      return require("node:child_process");
+    case "node:crypto":
+      return require("node:crypto");
+    case "node:events":
+      return require("node:events");
+    case "node:fs/promises":
+      return require("node:fs/promises");
+    case "node:http":
+      return require("node:http");
+    case "node:path":
+      return require("node:path");
+    default:
+      throw new Error(`Unexpected test dependency: ${name}`);
+  }
+}
+
+// Execute the real entry/service code with Electron replaced; no desktop or OS
+// registration is touched by these Windows lifecycle checks on other platforms.
+function loadWithElectronMocks(relativePath: string, replacements: Record<string, unknown>, runtime = process) {
+  const filename = fileURLToPath(new URL(relativePath, import.meta.url));
+  const require = createRequire(filename);
+  const output = ts.transpileModule(readFileSync(filename, "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true }
+  });
+  const exports: Record<string, any> = {};
+  runInNewContext(output.outputText, {
+    exports,
+    require: (name: string) =>
+      Object.hasOwn(replacements, name) ? replacements[name] : loadTestDependency(require, name),
+    process: runtime,
+    console,
+    Buffer,
+    URLSearchParams,
+    AbortSignal
+  });
+  return exports;
+}
+
+test("serialized Node plugin scripts keep credentials on stdin and recover after failure", async () => {
+  const calls = [];
+  const children = [];
+  const { LocalApplicationLauncher } = loadWithElectronMocks(
+    "../src/apps/local-app-launcher.ts",
+    {
+      "node:fs/promises": { stat: async () => ({ isFile: () => true }) },
+      "node:child_process": {
+        spawn: (executable, args, options) => {
+          const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), unref() {} });
+          let input = "";
+          child.stdin.on("data", (chunk) => {
+            input += chunk;
+          });
+          child.stdin.on("finish", () => {
+            calls.push({ executable, args, options, input: JSON.parse(input) });
+          });
+          children.push(child);
+          return child;
+        }
+      }
+    },
+    {
+      platform: "win32",
+      execPath: "C:/JumpServer/JumpServer.exe",
+      env: { JMS_CONNECT_JSON: "stale secret" }
+    } as unknown as NodeJS.Process
+  );
+  const launcher = new LocalApplicationLauncher({}, "", null, null);
+  const application = {
+    path: "C:/Navicat/navicat.exe",
+    plugin_dir: "/plugins/example",
+    script_path: "launch.mjs",
+    script_interpreter: "node",
+    script_input: "stdin",
+    script_serialize: true,
+    script_exit_messages: { 14: "Navicat: URI dialog unavailable" }
+  };
+  const payload = {
+    protocol: "sqlserver",
+    name: "root@a+b%2Bc",
+    endpoint: { host: "gateway.example", port: 5525 },
+    token: { id: "first", value: "first-secret" }
+  };
+  const values = { protocol: "sqlserver", dbname: "first-db" };
+  const first = launcher.launchScript(application, payload, values);
+  const failure = assert.rejects(first, /failed to launch client.*Navicat: URI dialog unavailable/);
+  const second = launcher.launchScript(
+    application,
+    { ...payload, token: { id: "second", value: "second-secret" } },
+    { ...values, dbname: "second-db" }
+  );
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].executable, "C:/JumpServer/JumpServer.exe");
+  assert.deepEqual(Array.from(calls[0].args), ["/plugins/example/launch.mjs"]);
+  assert.equal(calls[0].options.env.ELECTRON_RUN_AS_NODE, "1");
+  assert.equal(calls[0].options.env.JMS_CONNECT_JSON, undefined);
+  assert.equal(calls[0].input.executable, application.path);
+  assert.equal(calls[0].input.username, "first");
+  assert.equal(calls[0].input.source_name, "root@a+b%2Bc");
+  children[0].emit("spawn");
+  children[0].emit("exit", 14, null);
+  await failure;
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].input.username, "second");
+  assert.equal(calls[1].input.value, "second-secret");
+  assert.equal(calls[1].input.dbname, "second-db");
+  children[1].emit("spawn");
+  children[1].emit("exit", 0, null);
+  await second;
+  assert.equal(launcher.scriptQueues.size, 0);
+});
+
+test("Windows RDP launch preserves a connection file path containing spaces and waits for spawn", async () => {
+  const child = Object.assign(new EventEmitter(), { unref() {} });
+  let spawned: { executable: string; args: string[] };
+  let writtenPath = "";
+  const { LocalApplicationLauncher } = loadWithElectronMocks(
+    "../src/apps/local-app-launcher.ts",
+    {
+      "node:path": path.win32,
+      "node:fs/promises": {
+        mkdir: async () => {},
+        writeFile: async (file: string) => {
+          writtenPath = file;
+        },
+        stat: async () => ({ isFile: () => true })
+      },
+      "node:child_process": {
+        spawn: (executable: string, args: string[]) => {
+          spawned = { executable, args };
+          return child;
+        }
+      }
+    },
+    { platform: "win32", env: {} } as NodeJS.Process
+  );
+  const launcher = new LocalApplicationLauncher({}, "", { configDir: "C:\\Users\\Test User\\JumpServer" }, null);
+  let finished = false;
+  const launch = launcher
+    .launchFile(
+      { path: "C:\\WINDOWS\\system32\\mstsc.exe", arg_format: "{file}" },
+      { protocol: "rdp", file: { name: "asset", content: "full address:s:127.0.0.1:3389" } }
+    )
+    .then(() => {
+      finished = true;
+    });
+  await new Promise(setImmediate);
+  assert.equal(finished, false);
+  assert.equal(spawned.executable, "C:\\WINDOWS\\system32\\mstsc.exe");
+  assert.deepEqual(Array.from(spawned.args), [writtenPath]);
+  assert.equal(writtenPath, "C:\\Users\\Test User\\JumpServer\\asset.rdp");
+  child.emit("spawn");
+  await launch;
+  assert.equal(finished, true);
+});
+
+test("native launcher reports spawn errors without leaking connection arguments", async () => {
+  const child = Object.assign(new EventEmitter(), { unref() {} });
+  let resolveSpawned: () => void;
+  const spawned = new Promise<void>((resolve) => {
+    resolveSpawned = resolve;
+  });
+  let executable = "";
+  const { LocalApplicationLauncher } = loadWithElectronMocks(
+    "../src/apps/local-app-launcher.ts",
+    {
+      "node:child_process": {
+        spawn: (value: string) => {
+          executable = value;
+          resolveSpawned();
+          return child;
+        }
+      }
+    },
+    { platform: "linux", env: {} } as NodeJS.Process
+  );
+  const launcher = new LocalApplicationLauncher({}, "", null, null);
+  const launch = launcher.launchExecutable(
+    { path: "x-terminal-emulator", executable_type: "system" },
+    ["ssh", "-P", "test-secret"],
+    {}
+  );
+  const rejected = assert.rejects(launch, (error: Error) => {
+    assert.match(error.message, /failed to launch client.*ENOENT/);
+    assert.doesNotMatch(error.message, /test-secret/);
+    return true;
+  });
+  await spawned;
+  assert.equal(executable, "x-terminal-emulator");
+  child.emit("error", Object.assign(new Error("spawn failed with test-secret"), { code: "ENOENT" }));
+  await rejected;
+});
+
+test("macOS protocol launch waits for the terminal handoff and rejects failed AppleScript", async () => {
+  const child = Object.assign(new EventEmitter(), { unref() {} });
+  const { LocalApplicationLauncher } = loadWithElectronMocks(
+    "../src/apps/local-app-launcher.ts",
+    {
+      "node:child_process": { spawn: () => child },
+      "node:fs/promises": { stat: async () => ({ isFile: () => true }) }
+    },
+    { platform: "darwin", env: {} } as NodeJS.Process
+  );
+  const launcher = new LocalApplicationLauncher({}, "", null, null);
+  let finished = false;
+  const launch = launcher.launchScript(
+    {
+      plugin_dir: "/plugins/terminal",
+      script_path: "launch.applescript",
+      script_interpreter: "osascript",
+      path: "Terminal"
+    },
+    { protocol: "ssh", endpoint: { host: "example", port: 22 }, token: { id: "test", value: "secret" } },
+    { protocol: "ssh" }
+  );
+  const rejected = assert.rejects(launch, /failed to launch client.*exit code 1/).then(() => {
+    finished = true;
+  });
+  await new Promise(setImmediate);
+  child.emit("spawn");
+  await new Promise(setImmediate);
+  assert.equal(finished, false);
+  child.emit("exit", 1, null);
+  await rejected;
+});
+
+test("iTerm2 SSH, telnet and SFTP use plugin scripts and report handoff failures", async () => {
+  const projectRoot = fileURLToPath(new URL("../../", import.meta.url));
+  const service = new ApplicationConfigService({ getPath: () => projectRoot }, projectRoot);
+  let spawned;
+  let onSpawn: () => void;
+  let child;
+  const { LocalApplicationLauncher } = loadWithElectronMocks(
+    "../src/apps/local-app-launcher.ts",
+    {
+      "node:fs/promises": { stat: async () => ({ isFile: () => true }) },
+      "node:child_process": {
+        spawn: (executable: string, args: string[], options) => {
+          spawned = { executable, args, options };
+          onSpawn();
+          return child;
+        }
+      }
+    },
+    { platform: "darwin", env: {} } as NodeJS.Process
+  );
+  for (const protocol of ["ssh", "telnet", "sftp"]) {
+    const category = protocol === "sftp" ? "filetransfer" : "terminal";
+    const id = protocol === "sftp" ? "macos.iterm-sftp" : "macos.iterm";
+    const pluginDir = path.join(projectRoot, "plugins/macos", id);
+    const application = await service.buildItem(
+      { id, category, pluginDir, builtin: true },
+      { selections: { [`${category}:${protocol}`]: id } }
+    );
+    assert.equal(application.launch_type, "script");
+    assert.equal(application.launch_driver, "");
+    const launcher = new LocalApplicationLauncher(
+      { isPackaged: false },
+      "/Applications/JumpServer Test",
+      { getConfig: async () => ({ [category]: [application] }) },
+      null
+    );
+    for (const command of ["", '  ssh -t "user@host"\necho done  ']) {
+      child = Object.assign(new EventEmitter(), { unref() {} });
+      const didSpawn = new Promise<void>((resolve) => {
+        onSpawn = resolve;
+      });
+      const payload = {
+        protocol,
+        client: "iterm",
+        command,
+        endpoint: { host: "gateway.example", port: 2222 },
+        token: { id: "test-token", value: "test-secret" }
+      };
+      let finished = false;
+      const launch = launcher.launch(`jms2://${Buffer.from(JSON.stringify(payload)).toString("base64")}`);
+      const result = command
+        ? launch.then(() => {
+            finished = true;
+          })
+        : assert.rejects(launch, (error: Error) => {
+            assert.match(error.message, /failed to launch client.*exit code 1/);
+            assert.doesNotMatch(error.message, /test-secret/);
+            finished = true;
+            return true;
+          });
+      await didSpawn;
+      assert.equal(spawned.executable, "/usr/bin/osascript");
+      assert.deepEqual(Array.from(spawned.args), [path.join(pluginDir, "scripts/launch.macos.applescript")]);
+      assert.equal(spawned.options.detached, false);
+      const connection = JSON.parse(spawned.options.env.JMS_CONNECT_JSON);
+      assert.equal(connection.protocol, protocol === "telnet" ? "ssh" : protocol);
+      assert.equal(connection.helper, "'/Applications/JumpServer Test/.electron-resources/bin/jms-ssh'");
+      assert.equal(connection.command, command);
+      assert.equal(connection.username, "JMS-test-token");
+      assert.equal(connection.value, "test-secret");
+      child.emit("spawn");
+      await new Promise(setImmediate);
+      assert.equal(finished, false);
+      child.emit("exit", command ? 0 : 1, null);
+      await result;
+    }
+  }
+});
+
+test("iTerm2 plugin commands quote connection arguments and retain the new-tab policy", (context) => {
+  if (process.platform !== "darwin") return context.skip("requires macOS AppleScript");
+  for (const plugin of ["macos.iterm", "macos.iterm-sftp"]) {
+    const script = readFileSync(
+      new URL(`../../plugins/macos/${plugin}/scripts/launch.macos.applescript`, import.meta.url),
+      "utf8"
+    );
+    assert.match(script, /if \(count of windows\) > 0 then/);
+    assert.match(script, /set targetTab to create tab with default profile/);
+    assert.match(script, /create window with default profile/);
+    assert.match(script, /set targetTab to current tab/);
+    assert.match(script, /write text commandText/);
+
+    // Run the real JSON and quoting handler without opening or requiring iTerm2.
+    const source = `${script.split("\non run\n")[0]}\nreturn connectionCommand()\n`;
+    const connection = {
+      protocol: plugin === "macos.iterm" ? "ssh" : "sftp",
+      username: "JMS-test",
+      host: "gateway.example",
+      port: 2222,
+      value: "space ' quote \" $() \\ 中文\nnext line",
+      helper: "'/Applications/JumpServer Test/jms-ssh'",
+      command: ""
+    };
+    const run = (payload) =>
+      spawnSync("/usr/bin/osascript", ["-"], {
+        input: source,
+        encoding: "utf8",
+        env: { ...process.env, JMS_CONNECT_JSON: JSON.stringify(payload) }
+      });
+    const rendered = run(connection);
+    assert.equal(rendered.status, 0, rendered.stderr);
+    // Let a real shell decode the command as argv, without executing a connection.
+    const decoded = spawnSync("/bin/sh", ["-c", `set -- ${rendered.stdout.trimEnd()}; printf "%s\\0" "$@"`], {
+      encoding: "utf8"
+    });
+    assert.equal(decoded.status, 0, decoded.stderr);
+    assert.deepEqual(decoded.stdout.split("\0"), [
+      "/Applications/JumpServer Test/jms-ssh",
+      connection.protocol,
+      "JMS-test@gateway.example",
+      "-p",
+      "2222",
+      "-P",
+      connection.value,
+      ""
+    ]);
+    const direct = "ssh -t \"user@host\"\necho '中文'";
+    const result = run({ ...connection, helper: "", command: direct });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trimEnd(), direct);
+    const missingHelper = run({ ...connection, helper: "" });
+    assert.notEqual(missingHelper.status, 0);
+    assert.match(missingHelper.stderr, /SSH helper is missing/);
+  }
+});
+
+test("extracts Windows cold-start and forwarded URLs without changing their payload", () => {
+  const url = `${CLIENT_AUTH_CALLBACK}?code=a%2Bb&state=xyz`;
+  assert.equal(CLIENT_AUTH_CALLBACK, "jms2://auth/callback");
+  assert.equal(findClientProtocolUrl(["C:\\Program Files\\JumpServer\\jumpserver.exe", url, "--flag"]), url);
+  assert.equal(findClientProtocolUrl(["electron.exe", "C:\\My Project\\electron", `"${url}"`]), url);
+  assert.equal(findClientProtocolUrl(["jumpserver.exe"], { protocolUrl: url }), url);
+  assert.equal(findClientProtocolUrl(["jumpserver.exe", url], { protocolUrl: "https://untrusted.example/" }), url);
+  assert.equal(normalizeClientProtocolUrl(encodeURIComponent(url)), url);
+  assert.equal(normalizeClientProtocolUrl("JMS2://AbC+/DeF=="), "jms2://AbC+/DeF==");
+  assert.equal(findClientProtocolUrl(["jumpserver.exe", "jms://legacy", `https://site/?next=${url}`]), undefined);
+  assert.equal(normalizeClientProtocolUrl("jms2%3A%2F%2Fbad%ZZ"), undefined);
+});
+
+test("routes only HTTP and HTTPS asset payloads to the built-in web proxy", () => {
+  const encode = (payload: unknown) => `jms2://${Buffer.from(JSON.stringify(payload)).toString("base64")}`;
+  const http = decodeClientProtocolPayload(
+    encode({ protocol: "http", asset: { id: "asset-1" }, token: { id: "token" } })
+  );
+  const https = decodeClientProtocolPayload(encode({ protocol: "HTTPS", asset: { id: "asset-2" } }));
+  const ssh = decodeClientProtocolPayload(encode({ protocol: "ssh", asset: { id: "asset-3" } }));
+
+  assert.equal(isWebAssetClientProtocolPayload(http), true);
+  assert.equal(isWebAssetClientProtocolPayload(https), true);
+  assert.equal(isWebAssetClientProtocolPayload(ssh), false);
+  assert.equal(isWebAssetClientProtocolPayload({ protocol: "http", asset: {} }), false);
+});
+
+test("registers only jms2 and keeps the Windows development entry path as one argument", () => {
+  const calls: unknown[][] = [];
+  const app = {
+    setAsDefaultProtocolClient: (...args: unknown[]) => {
+      calls.push(args);
+      return true;
+    }
+  };
+  const runtime = {
+    platform: "win32" as const,
+    defaultApp: true,
+    execPath: "C:\\Program Files\\Electron\\electron.exe",
+    argv: ["electron.exe", "C:\\My Project\\electron"]
+  };
+  registerClientProtocol(app, runtime);
+  assert.deepEqual(calls, [["jms2", runtime.execPath, [runtime.argv[1]]]]);
+  calls.length = 0;
+  registerClientProtocol(app, { ...runtime, defaultApp: false });
+  assert.deepEqual(calls, [["jms2"]]);
+  calls.length = 0;
+  registerClientProtocol(app, { ...runtime, platform: "darwin" });
+  registerClientProtocol(app, { ...runtime, argv: ["electron.exe"] });
+  assert.deepEqual(calls, []);
+});
+
+for (const primary of [false, true]) {
+  test(`Windows ${primary ? "primary" : "secondary"} process handles a protocol launch once`, async () => {
+    const url = `${CLIENT_AUTH_CALLBACK}?code=abc&state=xyz`;
+    const events: string[] = [];
+    let forwarded: unknown;
+    const app = Object.assign(new EventEmitter(), {
+      setName: () => events.push("name"),
+      requestSingleInstanceLock: (data: unknown) => {
+        events.push("lock");
+        forwarded = data;
+        return primary;
+      },
+      quit: () => events.push("quit")
+    });
+    const runtime = { argv: ["jumpserver.exe", url], platform: "win32" } as NodeJS.Process;
+    const replacements = {
+      electron: { app },
+      "./shared/client-protocol": {
+        findClientProtocolUrl,
+        registerClientProtocol: () => events.push("register")
+      },
+      get "./desktop/main"() {
+        events.push("main");
+        return { handleIncomingProtocolUrl: () => {} };
+      }
+    };
+    loadWithElectronMocks("../src/bootstrap.ts", replacements, runtime);
+    await new Promise(setImmediate);
+    assert.equal((forwarded as { protocolUrl: string }).protocolUrl, url);
+    assert.deepEqual(events, primary ? ["name", "lock", "register", "main"] : ["name", "lock", "quit"]);
+  });
+}
+
+test("protocol events arriving while the desktop loads are forwarded after initialization", async () => {
+  const callback = `${CLIENT_AUTH_CALLBACK}?code=abc&state=xyz`;
+  const asset = "jms2://AbC+/DeF==";
+  const delivered: unknown[][] = [];
+  const app = Object.assign(new EventEmitter(), {
+    setName() {},
+    requestSingleInstanceLock: () => true
+  });
+  let prevented = false;
+  loadWithElectronMocks("../src/bootstrap.ts", {
+    electron: { app },
+    "./shared/client-protocol": { findClientProtocolUrl, registerClientProtocol() {} },
+    get "./desktop/main"() {
+      app.emit("second-instance", {}, ["jumpserver.exe"], "C:\\", { protocolUrl: callback });
+      app.emit("open-url", { preventDefault: () => (prevented = true) }, asset);
+      assert.equal(delivered.length, 0);
+      return { handleIncomingProtocolUrl: (...args: unknown[]) => delivered.push(args) };
+    }
+  });
+  await new Promise(setImmediate);
+  assert.equal(prevented, true);
+  assert.deepEqual(delivered, [
+    [callback, false],
+    [asset, undefined]
+  ]);
+  app.emit("second-instance", {}, ["jumpserver.exe", asset], "C:\\");
+  assert.deepEqual(delivered.at(-1), [asset, false]);
+});
+
+function authServiceFixture(isPackaged = true, createServer?: () => EventEmitter) {
+  const app = { getPath: () => "/unused", getVersion: () => "5.2.0", isPackaged };
+  const { DesktopAuthService } = loadWithElectronMocks("../src/auth/service.ts", {
+    electron: { app, net: {}, safeStorage: {} },
+    ...(createServer ? { "node:http": { createServer } } : {})
+  });
+  let resolveAuthorization: (url: string) => void;
+  const authorized = {
+    promise: new Promise<string>((resolve) => {
+      resolveAuthorization = resolve;
+    }),
+    resolve: (url: string) => resolveAuthorization(url)
+  };
+  const service = new DesktopAuthService((event: string, url: string) => {
+    if (event === "auth_url") authorized.resolve(url);
+  });
+  service.checkCompatibility = async ({ site }: { site: string }) => ({
+    status: "compatible",
+    site,
+    clientVersion: "5.2.0",
+    minCoreVersion: "5.2.0",
+    failures: []
+  });
+  service.fetchSite = async () => ({
+    ok: true,
+    text: async () =>
+      JSON.stringify({
+        client_id: "desktop",
+        client_login_policy: { reauth_on_exit: false, idle_lock_time: 0, max_session_time: 0 }
+      })
+  });
+  service.persistTokens = async () => {};
+  service.buildLoginPayload = async () => ({
+    status: "success",
+    bearer: "test-token",
+    profile: { success: true, data: '{"id":"test-user"}' }
+  });
+  return { service, authorized };
+}
+
+test("desktop API returns explicit text responses without JSON parsing", async () => {
+  const { service } = authServiceFixture();
+  service.sessions.set("session", {
+    sessionKey: "session",
+    origin: "https://jumpserver.example",
+    bearerToken: "token"
+  });
+  service.currentSessionKey = "session";
+  service.fetchSite = async () => ({ status: 200, text: async () => "full address:s:rdp.example\r\n" });
+
+  assert.equal(
+    await service.apiRequest({
+      method: "GET",
+      path: "/api/v1/authentication/connection-token/id/rdp-file/",
+      responseType: "text"
+    }),
+    "full address:s:rdp.example\r\n"
+  );
+});
+
+test("packaged login uses jms2 and ignores stale callbacks without losing the pending login", async () => {
+  const { service, authorized } = authServiceFixture();
+  await service.startCallbackServer();
+  assert.equal(service.redirectUri, CLIENT_AUTH_CALLBACK);
+  let exchange: Record<string, string>;
+  service.exchangeToken = async (_site: string, parameters: Record<string, string>) => {
+    exchange = parameters;
+    return { access_token: "test-token" };
+  };
+  const login = service.authLogin({ site: "https://site.example", sessionId: "account" });
+  const authorize = new URL(await authorized.promise);
+  const state = authorize.searchParams.get("state");
+  assert.equal(authorize.searchParams.get("redirect_uri"), CLIENT_AUTH_CALLBACK);
+  const pending = service.pendingAuth;
+  assert.equal(service.handleCallback(`${CLIENT_AUTH_CALLBACK}?code=old&state=old`), false);
+  assert.equal(service.handleCallback(`${CLIENT_AUTH_CALLBACK}?code=no-state`), false);
+  assert.equal(service.handleCallback(`jms://auth/callback?code=legacy&state=${state}`), false);
+  assert.equal(service.pendingAuth, pending);
+  assert.equal(service.handleCallback(`${CLIENT_AUTH_CALLBACK}?code=valid&state=${state}`), true);
+  assert.equal((await login).status, "success");
+  assert.equal(exchange.code, "valid");
+  assert.equal(exchange.redirect_uri, CLIENT_AUTH_CALLBACK);
+  assert.equal(service.handleCallback(`${CLIENT_AUTH_CALLBACK}?code=duplicate&state=${state}`), false);
+});
+
+test("OAuth denial completes the matching login with an error and does not exchange a token", async () => {
+  const { service, authorized } = authServiceFixture();
+  service.exchangeToken = () => assert.fail("a rejected authorization must not exchange a token");
+  const login = service.authLogin({ site: "https://site.example", sessionId: "account" });
+  const rejected = assert.rejects(login, /OAuth authorization failed: access_denied/);
+  const state = new URL(await authorized.promise).searchParams.get("state");
+  assert.equal(service.handleCallback(`${CLIENT_AUTH_CALLBACK}?error=access_denied&state=${state}`), true);
+  await rejected;
+  assert.equal(service.pendingAuth, null);
+});
+
+test("HTML-escaped confirmation callbacks still require the current login state", async () => {
+  for (const callback of [CLIENT_AUTH_CALLBACK, "http://127.0.0.1:14876/auth/callback"]) {
+    const { service, authorized } = authServiceFixture();
+    let exchangedCode = "";
+    service.exchangeToken = async (_site: string, parameters: Record<string, string>) => {
+      exchangedCode = parameters.code;
+      return { access_token: "test-token" };
+    };
+    const login = service.authLogin({ site: "https://site.example", sessionId: "account" });
+    const state = new URL(await authorized.promise).searchParams.get("state");
+    const pending = service.pendingAuth;
+    assert.equal(service.handleCallback(`${callback}?code=stale&amp;state=old`), false);
+    assert.equal(service.handleCallback(`${callback}?code=missing-state`), false);
+    assert.equal(service.handleCallback(`${callback}?code=ambiguous&state=${state}&amp;state=old`), false);
+    assert.equal(service.pendingAuth, pending);
+    assert.equal(service.handleCallback(`${callback}?code=a%2Bb&amp;state=${state}`), true);
+    assert.equal((await login).status, "success");
+    assert.equal(exchangedCode, "a+b");
+    assert.equal(service.handleCallback(`${callback}?code=duplicate&amp;state=${state}`), false);
+  }
+});
+
+test("cancelling a login rejects its later callback", async () => {
+  const { service, authorized } = authServiceFixture();
+  const login = service.authLogin({ site: "https://site.example", sessionId: "account" });
+  const state = new URL(await authorized.promise).searchParams.get("state");
+  service.cancelAuth();
+  assert.equal((await login).status, "stale");
+  assert.equal(service.handleCallback(`${CLIENT_AUTH_CALLBACK}?code=cancelled&state=${state}`), false);
+});
+
+function callbackServerFixture(occupied = false) {
+  return Object.assign(new EventEmitter(), {
+    listening: false,
+    listen(port: number, hostname: string, ready: () => void) {
+      assert.equal(port, 14876);
+      assert.equal(hostname, "127.0.0.1");
+      queueMicrotask(() => {
+        if (occupied) this.emit("error", Object.assign(new Error("port occupied"), { code: "EADDRINUSE" }));
+        else {
+          this.listening = true;
+          ready();
+          this.emit("listening");
+        }
+      });
+    },
+    close() {}
+  });
+}
+
+test("an occupied development callback port stops login instead of using another client's deep link", async () => {
+  const { service } = authServiceFixture(false, () => callbackServerFixture(true));
+  service.emitEvent = () => assert.fail("must not open a browser without its callback listener");
+  service.fetchSite = () => assert.fail("must fail before starting OAuth");
+  await assert.rejects(service.authLogin({ site: "https://site.example", sessionId: "account" }), /14876.*in use/);
+  assert.equal(service.callbackServer, null);
+  assert.equal(service.pendingAuth, null);
+});
+
+test("development login waits for an in-progress callback listener and preserves the loopback flow", async () => {
+  let listeners = 0;
+  const { service, authorized } = authServiceFixture(false, () => {
+    listeners++;
+    return callbackServerFixture();
+  });
+  service.exchangeToken = async () => ({ access_token: "test-token" });
+  const bootstrap = service.startCallbackServer();
+  const login = service.authLogin({ site: "https://site.example", sessionId: "account" });
+  const authorize = new URL(await authorized.promise);
+  await bootstrap;
+  assert.equal(listeners, 1);
+  const callback = new URL(authorize.searchParams.get("redirect_uri"));
+  assert.equal(callback.toString(), "http://127.0.0.1:14876/auth/callback");
+  callback.searchParams.set("code", "valid");
+  callback.searchParams.set("state", authorize.searchParams.get("state"));
+  assert.equal(service.handleCallback(callback.toString()), true);
+  assert.equal((await login).status, "success");
+});
